@@ -23,8 +23,8 @@ API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myx
 API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
 
 # Telegram Config (Isi manual jika tidak pakai env var)
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8361349338:AAHOlx4fKz_bp1MHnVg8CxS9MY_pcejxLes') 
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003558146379')
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA') 
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003896189739')
 
 # Setting Bot
 TIMEFRAME = '6h'       # Timeframe Eksekusi (DIUBAH KE 6 JAM)
