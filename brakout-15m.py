@@ -22,8 +22,8 @@ TELEGRAM_TOKEN = '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA'
 TELEGRAM_CHAT_ID = '-1003842052901'
 
 # Parameter Scanner
-TIMEFRAME = '15'       # Timeframe (15m, 1h, 4h)
-LIMIT_CANDLES = 100    # Jumlah candle yang dianalisis
+TIMEFRAME = '15m'       # Timeframe (15m, 1h, 4h)
+LIMIT_CANDLES = 200    # Jumlah candle yang dianalisis
 TOP_COINS_COUNT = 300  # Jumlah koin yang di-scan
 VOLUME_THRESHOLD = 2.0 # Z-Score Volume (Batas Anomaly)
 
