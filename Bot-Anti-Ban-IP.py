@@ -19,8 +19,15 @@ try:
     import pandas_ta as ta
     import mplfinance as mpf
     import requests
+    
+    # --- FIX CHART UNTUK VPS/SERVER ---
+    import matplotlib
+    matplotlib.use('Agg') # Mode tanpa layar (Headless)
+    import matplotlib.pyplot as plt
+    # ----------------------------------
+
 except ImportError as e:
-    sys.exit(f"Library Error: {e}. Install dulu: pip install ccxt pandas pandas_ta mplfinance requests numpy")
+    sys.exit(f"Library Error: {e}. Install dulu: pip install ccxt pandas pandas_ta mplfinance requests numpy matplotlib")
 
 # ==========================================
 # 2. KONFIGURASI
@@ -31,7 +38,6 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6
 # Telegram Config (Isi manual jika tidak pakai env var)
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA') 
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003812500986')
-
  
 # SETTING STRATEGI
 TIMEFRAMES = ['1d', '4h', '1h', '15m']
@@ -39,17 +45,16 @@ VOL_MULTIPLIER = 2.0
 TOP_COIN_COUNT = 300    
 
 # --- ANTI-BAN CONFIG ---
-# Jangan set lebih dari 5 jika menggunakan public connection (tanpa API Key premium)
 MAX_THREADS = 4         
-DELAY_BETWEEN_TF = 0.5  # Jeda detik antar request timeframe
-SCAN_COOLDOWN = 30      # Jeda detik setelah 1 putaran scan selesai
+DELAY_BETWEEN_TF = 0.5  
+SCAN_COOLDOWN = 30      
 
 OUTPUT_FOLDER = 'volume_safe_results'
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 processed_signals = {} 
 
 # ==========================================
-# 3. KONEKSI EXCHANGE (Optimized)
+# 3. KONEKSI EXCHANGE
 # ==========================================
 exchange = ccxt.binance({
     'apiKey': API_KEY, 'secret': API_SECRET,
@@ -57,7 +62,7 @@ exchange = ccxt.binance({
         'defaultType': 'future',
         'adjustForTimeDifference': True
     },
-    'enableRateLimit': True, # WAJIB AKTIF
+    'enableRateLimit': True, 
 })
 
 # ==========================================
@@ -93,15 +98,27 @@ def send_telegram_alert(symbol, data, image_path):
     try:
         with open(image_path, "rb") as img:
             requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'caption': caption, 'parse_mode': 'HTML'}, files={'photo': img}, timeout=20)
+        
+        # Hapus gambar setelah terkirim agar VPS tidak penuh
+        try: os.remove(image_path)
+        except: pass
+
     except Exception as e:
-        print(f"Gagal kirim TG: {e}")
+        print(f"❌ Gagal kirim TG: {e}")
 
 def generate_chart(df, symbol, signal_info):
     try:
-        filename = f"{OUTPUT_FOLDER}/{symbol.replace('/','-')}_{signal_info['tipe']}.png"
-        plot_df = df.tail(80).set_index('timestamp')
+        # Bersihkan nama file dari karakter aneh
+        safe_symbol = symbol.replace('/','-')
+        filename = f"{OUTPUT_FOLDER}/{safe_symbol}_{signal_info['tipe']}_{int(time.time())}.png"
         
-        style = mpf.make_mpf_style(base_mpf_style='nightclouds', rc={'font.size': 8})
+        # Pastikan index adalah Datetime
+        plot_df = df.tail(80).copy()
+        plot_df.index = pd.to_datetime(plot_df['timestamp'])
+        
+        # Style Chart
+        # Gunakan style default jika nightclouds bermasalah
+        my_style = mpf.make_mpf_style(base_mpf_style='charles', rc={'font.size': 8})
         
         adds = [
             mpf.make_addplot(plot_df['BB_Up'], color='green', width=0.5, alpha=0.3),
@@ -113,19 +130,22 @@ def generate_chart(df, symbol, signal_info):
         
         title_text = f"{symbol} [15M] - {signal_info['tipe']} | SAFE MODE"
         
-        mpf.plot(plot_df, type='candle', style=style, addplot=adds, 
-                 title=title_text, savefig=dict(fname=filename, bbox_inches='tight'), 
+        # Generate Plot (Matplotlib Agg backend active)
+        mpf.plot(plot_df, type='candle', style=my_style, addplot=adds, 
+                 title=title_text, 
+                 savefig=dict(fname=filename, bbox_inches='tight', dpi=100), 
                  volume=False, panel_ratios=(6, 2))
+                 
         return filename
-    except: return None
+    except Exception as e:
+        # Tampilkan error chart yang sebenarnya
+        print(f"❌ Error Membuat Chart {symbol}: {e}")
+        return None
 
 # ==========================================
 # 5. DATA FETCHING (SAFE FETCH)
 # ==========================================
 def fetch_data_safe(symbol, timeframe, limit=50, retries=3):
-    """
-    Mengambil data dengan mekanisme Retry & Backoff untuk mencegah Ban
-    """
     for i in range(retries):
         try:
             bars = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
@@ -133,11 +153,9 @@ def fetch_data_safe(symbol, timeframe, limit=50, retries=3):
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             return df
         except ccxt.RateLimitExceeded:
-            wait_time = (i + 1) * 2 # Tunggu 2s, 4s, 6s...
+            wait_time = (i + 1) * 2
             print(f"⚠️ Rate Limit! Cooling down {wait_time}s...")
             time.sleep(wait_time)
-        except ccxt.NetworkError:
-            time.sleep(1)
         except Exception as e:
             return None
     return None
@@ -201,8 +219,6 @@ def worker_multi_layer(symbol):
         
         ema50_1d = ta.ema(df_1d['close'], length=50).iloc[-1]
         bias_1d = "BULLISH" if df_1d['close'].iloc[-1] > ema50_1d else "BEARISH"
-        
-        # Jeda Keamanan
         time.sleep(DELAY_BETWEEN_TF)
 
         # LAYER 2: 4H
@@ -213,8 +229,6 @@ def worker_multi_layer(symbol):
         if bias_1d == "BULLISH" and rsi_4h > 75: return None 
         if bias_1d == "BEARISH" and rsi_4h < 25: return None
         status_4h = f"RSI {rsi_4h:.0f}"
-
-        # Jeda Keamanan
         time.sleep(DELAY_BETWEEN_TF)
 
         # LAYER 3: 1H
@@ -223,10 +237,7 @@ def worker_multi_layer(symbol):
         bb_1h = df_1h.ta.bbands(length=20, std=2)
         status_1h = "OK" if (bias_1d=="BULLISH" and df_1h['close'].iloc[-1] > bb_1h.iloc[-1, 1]) or \
                             (bias_1d=="BEARISH" and df_1h['close'].iloc[-1] < bb_1h.iloc[-1, 1]) else "Weak"
-        
         if status_1h == "Weak": return None
-
-        # Jeda Keamanan
         time.sleep(DELAY_BETWEEN_TF)
 
         # LAYER 4: 15M (ENTRY)
@@ -236,7 +247,6 @@ def worker_multi_layer(symbol):
         df_15m = add_5_indicators(df_15m)
         df_15m.ta.bbands(length=20, std=2, append=True)
         
-        # Vol Filter
         curr_vol = df_15m['volume'].iloc[-2]
         avg_vol = df_15m['volume'].iloc[-8:-2].mean()
         spike_ratio = curr_vol / avg_vol if avg_vol > 0 else 0
@@ -245,24 +255,21 @@ def worker_multi_layer(symbol):
         
         pattern, pa_signal = analyze_price_action(df_15m)
 
-        # FINAL DECISION
         is_valid = False
         tipe_signal = "NONE"
         c = df_15m.iloc[-2]
         
         if bias_1d == "BULLISH":
-            if c['close'] > c['SUAMI']: # Di atas MA50
-                if pa_signal == "BUY" or c['ADIK'] > c['SUAMI']: # Ada PA atau Golden Cross
+            if c['close'] > c['SUAMI']: 
+                if pa_signal == "BUY" or c['ADIK'] > c['SUAMI']: 
                     is_valid = True; tipe_signal = "BUY"
-                    
         elif bias_1d == "BEARISH":
-            if c['close'] < c['SUAMI']: # Di bawah MA50
-                if pa_signal == "SELL" or c['ADIK'] < c['SUAMI']: # Ada PA atau Death Cross
+            if c['close'] < c['SUAMI']: 
+                if pa_signal == "SELL" or c['ADIK'] < c['SUAMI']: 
                     is_valid = True; tipe_signal = "SELL"
 
         if is_valid:
             indo_data = analyze_5_indicators_logic(df_15m, tipe_signal)
-            
             res = {
                 'symbol': symbol, 'time': df_15m['timestamp'].iloc[-2],
                 'price': df_15m['close'].iloc[-1], 'tipe': tipe_signal,
@@ -274,15 +281,15 @@ def worker_multi_layer(symbol):
             res.update(indo_data)
             return res
 
-    except Exception as e: return None
+    except Exception: return None
     return None
 
 # ==========================================
 # 7. MAIN LOOP
 # ==========================================
 def main():
-    print(f"=== BOT ANTI-BAN (SAFE MODE) ===")
-    print(f"Threads: {MAX_THREADS} | Delay TF: {DELAY_BETWEEN_TF}s | Cooldown: {SCAN_COOLDOWN}s")
+    print(f"=== BOT ANTI-BAN (SAFE MODE + CHART FIX) ===")
+    print(f"Threads: {MAX_THREADS} | Delay TF: {DELAY_BETWEEN_TF}s")
     
     global processed_signals
 
@@ -292,13 +299,10 @@ def main():
             tickers = exchange.fetch_tickers()
             symbols = sorted([t for t in tickers if '/USDT' in t and 'UP/' not in t], 
                              key=lambda x: tickers[x]['quoteVolume'], reverse=True)[:TOP_COIN_COUNT]
-            
-            # Acak urutan symbol agar tidak scan koin yang sama persis di detik yang sama tiap loop
             random.shuffle(symbols) 
 
             sys.stdout.write(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🛡 Safe Scanning {len(symbols)} coins...\n")
             
-            found = 0
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
                 futures = {executor.submit(worker_multi_layer, sym): sym for sym in symbols}
                 completed = 0
@@ -314,12 +318,16 @@ def main():
                         sym = res['symbol']
                         if processed_signals.get(sym) != res['time']:
                             processed_signals[sym] = res['time']
-                            found += 1
                             print(f"\n🔥 {sym} [{res['tipe']}]")
                             img = generate_chart(res['df'], sym, res)
-                            if img: send_telegram_alert(sym, res, img)
+                            
+                            # Log jika gambar gagal dibuat
+                            if img is None:
+                                print(f"⚠️ Gambar chart {sym} gagal dibuat.")
+                            
+                            send_telegram_alert(sym, res, img)
             
-            print(f"\n✅ Scan Selesai. Istirahat {SCAN_COOLDOWN} detik untuk keamanan IP...")
+            print(f"\n✅ Scan Selesai. Istirahat {SCAN_COOLDOWN} detik...")
             time.sleep(SCAN_COOLDOWN) 
 
         except KeyboardInterrupt: break
@@ -328,5 +336,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
