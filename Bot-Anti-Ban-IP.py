@@ -38,6 +38,7 @@ API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6
 # Telegram Config (Isi manual jika tidak pakai env var)
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA') 
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003812500986')
+
  
 # SETTING STRATEGI
 TIMEFRAMES = ['1d', '4h', '1h', '15m']
@@ -117,20 +118,26 @@ def generate_chart(df, symbol, signal_info):
         plot_df.index = pd.to_datetime(plot_df['timestamp'])
         
         # Style Chart
-        # Gunakan style default jika nightclouds bermasalah
         my_style = mpf.make_mpf_style(base_mpf_style='charles', rc={'font.size': 8})
         
-        adds = [
-            mpf.make_addplot(plot_df['BB_Up'], color='green', width=0.5, alpha=0.3),
-            mpf.make_addplot(plot_df['BB_Low'], color='green', width=0.5, alpha=0.3),
-            mpf.make_addplot(plot_df['SUAMI'], color='red', width=1.5), 
-            mpf.make_addplot(plot_df['ADIK'], color='cyan', width=1.0),
-            mpf.make_addplot(plot_df['CFM'], panel=1, color='orange', ylabel='CFM'),
-        ]
+        # Cek ketersediaan kolom sebelum plot
+        adds = []
+        if 'BB_Up' in plot_df.columns and 'BB_Low' in plot_df.columns:
+            adds.append(mpf.make_addplot(plot_df['BB_Up'], color='green', width=0.5, alpha=0.3))
+            adds.append(mpf.make_addplot(plot_df['BB_Low'], color='green', width=0.5, alpha=0.3))
+        
+        if 'SUAMI' in plot_df.columns:
+            adds.append(mpf.make_addplot(plot_df['SUAMI'], color='red', width=1.5))
+        
+        if 'ADIK' in plot_df.columns:
+            adds.append(mpf.make_addplot(plot_df['ADIK'], color='cyan', width=1.0))
+            
+        if 'CFM' in plot_df.columns:
+            adds.append(mpf.make_addplot(plot_df['CFM'], panel=1, color='orange', ylabel='CFM'))
         
         title_text = f"{symbol} [15M] - {signal_info['tipe']} | SAFE MODE"
         
-        # Generate Plot (Matplotlib Agg backend active)
+        # Generate Plot
         mpf.plot(plot_df, type='candle', style=my_style, addplot=adds, 
                  title=title_text, 
                  savefig=dict(fname=filename, bbox_inches='tight', dpi=100), 
@@ -138,7 +145,6 @@ def generate_chart(df, symbol, signal_info):
                  
         return filename
     except Exception as e:
-        # Tampilkan error chart yang sebenarnya
         print(f"❌ Error Membuat Chart {symbol}: {e}")
         return None
 
@@ -245,7 +251,16 @@ def worker_multi_layer(symbol):
         if df_15m is None: return None
         
         df_15m = add_5_indicators(df_15m)
-        df_15m.ta.bbands(length=20, std=2, append=True)
+        
+        # --- FIX UTAMA: MENAMAI KOLOM BB DENGAN EKSPLISIT ---
+        bb = df_15m.ta.bbands(length=20, std=2)
+        if bb is not None:
+            df_15m['BB_Low'] = bb.iloc[:, 0]
+            df_15m['BB_Mid'] = bb.iloc[:, 1]
+            df_15m['BB_Up']  = bb.iloc[:, 2]
+        else:
+            return None # Skip jika BB gagal dihitung
+        # ----------------------------------------------------
         
         curr_vol = df_15m['volume'].iloc[-2]
         avg_vol = df_15m['volume'].iloc[-8:-2].mean()
@@ -288,7 +303,7 @@ def worker_multi_layer(symbol):
 # 7. MAIN LOOP
 # ==========================================
 def main():
-    print(f"=== BOT ANTI-BAN (SAFE MODE + CHART FIX) ===")
+    print(f"=== BOT ANTI-BAN (SAFE MODE + CHART FIX BB_UP) ===")
     print(f"Threads: {MAX_THREADS} | Delay TF: {DELAY_BETWEEN_TF}s")
     
     global processed_signals
