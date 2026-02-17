@@ -14,8 +14,9 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8562793193:AAHDulfzVhhnuPfNfy
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003822778016')
 
 
-# Konfigurasi Trading
+# Konfigurasi Scanner
 LIMIT_CANDLES = 100
+TOP_COINS = 400        # SCAN 400 KOIN TERATAS
 BATCH_SIZE = 20       
 DELAY_BATCH = 0.5     
 
@@ -40,12 +41,7 @@ def send_telegram_sync(message):
     if not TELEGRAM_TOKEN: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        # Split pesan panjang (Telegram max 4096 char)
-        if len(message) > 4000:
-            for x in range(0, len(message), 4000):
-                requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message[x:x+4000], "parse_mode": "Markdown"}, timeout=10)
-        else:
-            requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=10)
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=5)
     except Exception as e:
         print(f"[ERROR] TG: {e}")
 
@@ -58,26 +54,28 @@ def send_photo_sync(caption, filepath):
     except Exception as e:
         print(f"[ERROR] Foto: {e}")
 
-def generate_chart(df, symbol, timeframe, side):
+def generate_chart(df, symbol, timeframe, extra_info=""):
     filename = f"chart_{symbol.replace('/', '')}_{timeframe}_{int(time.time())}.png"
     try:
         plot_df = df.tail(60).copy()
         plot_df.set_index('timestamp', inplace=True)
         mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', inherit=True)
         s = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', y_on_right=True)
+        
         ap = [
             mpf.make_addplot(plot_df['MA5'], color='cyan', width=1),
             mpf.make_addplot(plot_df['MA10'], color='orange', width=1),
             mpf.make_addplot(plot_df['MA30'], color='purple', width=2),
         ]
-        title_text = f"{symbol} ({timeframe}) - {side}"
+        
+        title_text = f"{symbol} ({timeframe}) {extra_info}"
         mpf.plot(plot_df, type='candle', style=s, addplot=ap, title=title_text,
                  savefig=dict(fname=filename, dpi=80, bbox_inches='tight'), volume=False)
         return filename
     except:
         return None
 
-# ================= INDICATORS & MOVERS =================
+# ================= INDICATORS =================
 
 async def calculate_natr(exchange, symbol, timeframe, period):
     try:
@@ -94,66 +92,43 @@ async def calculate_natr(exchange, symbol, timeframe, period):
     except:
         return 0.0
 
-async def get_momentum_symbols(exchange):
-    """
-    LOGIKA BARU: Mengambil Top 50 Gainers & Top 50 Losers
-    """
-    print("🔍 Mengambil Top 50 Gainers & Top 50 Losers...")
-    try:
-        tickers = await exchange.fetch_tickers()
-        valid_tickers = []
-        
-        for symbol, data in tickers.items():
-            # Filter USDT Futures & Aktif
-            if '/USDT' in symbol and data.get('percentage') is not None and data.get('active') != False:
-                 valid_tickers.append({
-                     'symbol': symbol,
-                     'change': data['percentage'],
-                     'price': data['last']
-                 })
-        
-        # Sortir berdasarkan Persentase Perubahan (Tinggi ke Rendah)
-        valid_tickers.sort(key=lambda x: x['change'], reverse=True)
-        
-        # Ambil 50 Teratas (Gainers)
-        top_gainers = valid_tickers[:50]
-        # Ambil 50 Terbawah (Losers)
-        top_losers = valid_tickers[-50:]
-        
-        # Gabungkan List (Total 100 Koin)
-        target_list = top_gainers + top_losers
-        
-        # Ambil simbolnya saja
-        target_symbols = [x['symbol'] for x in target_list]
-        
-        print(f"✅ Target Scan: {len(target_symbols)} Koin (Momentum).")
-        return target_symbols, top_gainers, top_losers
-        
-    except Exception as e:
-        print(f"Error Momentum Symbols: {e}")
-        return [], [], []
+def calculate_rsi(df, period=14):
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-async def report_market_movers(top_gainers, top_losers):
-    """Kirim Laporan ke Telegram"""
-    try:
-        # --- KIRIM PESAN GAINERS ---
-        msg_gainers = "🚀 **TOP 50 GAINERS (24H)** 🚀\nScan Target:\n\n"
-        for i, coin in enumerate(top_gainers, 1):
-            msg_gainers += f"{i}. `{coin['symbol'].replace('/','')}`: +{coin['change']:.2f}% (${coin['price']})\n"
-        send_telegram_sync(msg_gainers)
-        
-        await asyncio.sleep(1)
-
-        # --- KIRIM PESAN LOSERS ---
-        msg_losers = "🩸 **TOP 50 LOSERS (24H)** 🩸\nScan Target:\n\n"
-        for i, coin in enumerate(reversed(top_losers), 1):
-            msg_losers += f"{i}. `{coin['symbol'].replace('/','')}`: {coin['change']:.2f}% (${coin['price']})\n"
-        send_telegram_sync(msg_losers)
-        
-    except Exception as e:
-        print(f"Error Report: {e}")
+def calculate_macd(df, fast=12, slow=26, signal=9):
+    exp12 = df['close'].ewm(span=fast, adjust=False).mean()
+    exp26 = df['close'].ewm(span=slow, adjust=False).mean()
+    macd = exp12 - exp26
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    return macd, signal_line
 
 # ================= CORE LOGIC =================
+
+async def get_top_volume_symbols(exchange):
+    """Mengambil Top 400 Koin Futures berdasarkan Volume"""
+    print(f"🔍 Mengambil Top {TOP_COINS} Koin berdasarkan Volume...")
+    try:
+        markets = await exchange.load_markets()
+        tickers = await exchange.fetch_tickers()
+        futures = []
+        for symbol, data in tickers.items():
+            if symbol in markets and markets[symbol].get('quote') == 'USDT' and markets[symbol].get('active'):
+                futures.append({'symbol': symbol, 'volume': data.get('quoteVolume', 0)})
+        
+        # Sort Volume Tertinggi
+        futures.sort(key=lambda x: x['volume'], reverse=True)
+        
+        # Ambil Top N
+        top_symbols = [x['symbol'] for x in futures[:TOP_COINS]]
+        print(f"✅ Siap Scan {len(top_symbols)} Koin.")
+        return top_symbols
+    except Exception as e:
+        print(f"Error Fetch Symbols: {e}")
+        return []
 
 async def process_coin(exchange, symbol, timeframe):
     try:
@@ -163,22 +138,65 @@ async def process_coin(exchange, symbol, timeframe):
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
+        # --- INDIKATOR UTAMA ---
         df['MA5'] = df['close'].rolling(window=5).mean()
         df['MA10'] = df['close'].rolling(window=10).mean()
         df['MA30'] = df['close'].rolling(window=30).mean()
+        
+        # --- INDIKATOR TAMBAHAN (RSI, MACD, VOL) ---
+        df['RSI'] = calculate_rsi(df)
+        df['MACD'], df['MACD_SIGNAL'] = calculate_macd(df)
+        df['VolMA'] = df['volume'].rolling(window=20).mean() # Rata-rata Volume 20 candle
 
         last_closed = df.iloc[-2]
         prev_closed = df.iloc[-3]
         candle_ts = last_closed['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
         
+        # --- FILTER PENTING: CEK VOLUME ABNORMAL ---
+        curr_vol = last_closed['volume']
+        avg_vol = last_closed['VolMA']
+        vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 0
+        
+        is_high_vol = vol_ratio > 1.5   # Volume Tinggi (> 1.5x rata-rata)
+        is_low_vol = vol_ratio < 0.5    # Volume Rendah (< 0.5x rata-rata)
+        
+        # JIKA VOLUME NORMAL (0.5 s/d 1.5), SKIP KOIN INI
+        if not (is_high_vol or is_low_vol):
+            return None  # Stop, jangan proses lebih lanjut
+
+        # Jika lolos filter (market tidak normal), lanjut analisa...
+        
+        vol_desc = f"🔥 HIGH ({vol_ratio:.1f}x)" if is_high_vol else f"❄️ LOW ({vol_ratio:.1f}x)"
+        
         result = {
             'symbol': symbol, 'type': None, 'side': None,
             'data': last_closed, 'df': df, 'tf': timeframe, 'ts': candle_ts,
-            'natr_1m': 0.0, 'natr_5m': 0.0
+            'natr_1m': 0.0, 'natr_5m': 0.0,
+            'rsi': 0, 'macd_status': '', 'vol_status': vol_desc
         }
         has_alert = False
 
-        # LOGIKA 1: GOLDEN CROSS
+        # --- ANALISA TEKNIKAL ---
+        
+        # 1. RSI Status
+        rsi_val = last_closed['RSI']
+        rsi_desc = "Neutral"
+        if rsi_val > 70: rsi_desc = "OVERBOUGHT (>70) 🔴"
+        elif rsi_val < 30: rsi_desc = "OVERSOLD (<30) 🟢"
+        elif rsi_val > 60: rsi_desc = "Strong Bull"
+        elif rsi_val < 40: rsi_desc = "Strong Bear"
+        
+        # 2. MACD Status
+        macd_val = last_closed['MACD']
+        sig_val = last_closed['MACD_SIGNAL']
+        macd_desc = "Bullish 🟢" if macd_val > sig_val else "Bearish 🔴"
+
+        result['rsi'] = f"{rsi_val:.1f} ({rsi_desc})"
+        result['macd_status'] = macd_desc
+
+        # --- LOGIKA TRIGGER SIGNAL ---
+        
+        # Trigger 1: GOLDEN CROSS
         if prev_closed['MA5'] <= prev_closed['MA10'] and last_closed['MA5'] > last_closed['MA10']:
             if not is_signal_already_sent(symbol, timeframe, candle_ts, 'GOLDEN_CROSS'):
                 result['type'] = 'GOLDEN_CROSS'
@@ -186,7 +204,7 @@ async def process_coin(exchange, symbol, timeframe):
                 has_alert = True
                 mark_signal_as_sent(symbol, timeframe, candle_ts, 'GOLDEN_CROSS')
 
-        # LOGIKA 2: MA30 TOUCH (Skip 5m)
+        # Trigger 2: MA30 TOUCH (Skip 5m)
         elif timeframe != '5m': 
             if last_closed['low'] <= last_closed['MA30'] <= last_closed['high']:
                 if not is_signal_already_sent(symbol, timeframe, candle_ts, 'MA30_TOUCH'):
@@ -197,8 +215,18 @@ async def process_coin(exchange, symbol, timeframe):
                         result['side'] = 'SHORT 🔴 (Reject)'
                     has_alert = True
                     mark_signal_as_sent(symbol, timeframe, candle_ts, 'MA30_TOUCH')
+        
+        # Trigger 3: EXTREME VOLUME ONLY (Jika tidak ada cross/touch, tapi volume sangat ekstrem)
+        # Misal volume naik > 2.5x rata-rata, kita anggap ini signal tersendiri
+        elif vol_ratio > 2.5:
+             if not is_signal_already_sent(symbol, timeframe, candle_ts, 'VOL_SPIKE'):
+                result['type'] = 'VOLUME_SPIKE'
+                result['side'] = 'INFO ⚠️'
+                has_alert = True
+                mark_signal_as_sent(symbol, timeframe, candle_ts, 'VOL_SPIKE')
 
         if has_alert:
+            # Hitung NATR jika ada sinyal valid & volume tidak normal
             task1 = calculate_natr(exchange, symbol, '1m', 30)
             task2 = calculate_natr(exchange, symbol, '5m', 14)
             natr_results = await asyncio.gather(task1, task2)
@@ -210,7 +238,7 @@ async def process_coin(exchange, symbol, timeframe):
     except:
         return None
 
-async def run_scanner_job(active_timeframes, do_market_report=False):
+async def run_scanner_job(active_timeframes):
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔄 Memulai Scan: {active_timeframes}")
     
     exchange = ccxt.binance({
@@ -219,19 +247,11 @@ async def run_scanner_job(active_timeframes, do_market_report=False):
     })
 
     try:
-        # 1. AMBIL DATA MOMENTUM (Gainers/Losers)
-        # Koin inilah yang akan discan untuk mencari Golden Cross/MA Touch
-        symbols, top_gainers, top_losers = await get_momentum_symbols(exchange)
-        
-        if not symbols: 
-            print("Gagal mengambil data momentum.")
-            return
+        # 1. AMBIL TOP 400 VOLUME
+        symbols = await get_top_volume_symbols(exchange)
+        if not symbols: return
 
-        # 2. KIRIM LAPORAN (Jika jadwalnya tiba)
-        if do_market_report:
-            await report_market_movers(top_gainers, top_losers)
-
-        # 3. SCAN SINYAL (Hanya pada koin-koin momentum tersebut)
+        # 2. SCAN SIGNAL
         for tf in active_timeframes:
             print(f"📊 Scanning {tf} ({len(symbols)} coins)...")
             for i in range(0, len(symbols), BATCH_SIZE):
@@ -245,24 +265,40 @@ async def run_scanner_job(active_timeframes, do_market_report=False):
                         price = res['data']['close']
                         tf_res = res['tf']
                         signal_side = res['side']
-                        natr_1m = res['natr_1m']
-                        natr_5m = res['natr_5m']
+                        signal_type = res['type']
                         
+                        # Data Indikator
+                        rsi_info = res['rsi']
+                        macd_info = res['macd_status']
+                        vol_info = res['vol_status']
+                        natr_1m = res['natr_1m']
+                        
+                        # Status NATR 5m
+                        natr_5m = res['natr_5m']
                         status_5m = "Normal"
                         if natr_5m > 0.8: status_5m = "High Vol"
                         elif natr_5m < 0.2: status_5m = "Low Vol"
 
+                        # Header & Caption
                         header = "🚀" if "LONG" in signal_side else "🔻"
+                        if signal_type == 'VOLUME_SPIKE': header = "⚡"
+                        
                         msg_caption = (
                             f"{header} **SIGNAL {signal_side}**\n\n"
                             f"🪙 `#{symbol.replace('/','')}`\n"
                             f"⏱ TF: `{tf_res}` | 💵 ${price}\n\n"
-                            f"📊 **NATR:**\n1m/30: `{natr_1m:.3f}%`\n5m/14: `{natr_5m:.3f}%` ({status_5m})\n\n"
-                            f"📋 Info: {res['type'].replace('_', ' ')}"
+                            f"📊 **Volume:** {vol_info}\n"
+                            f"📈 **RSI:** {rsi_info}\n"
+                            f"📉 **MACD:** {macd_info}\n\n"
+                            f"🌪 **NATR:**\n1m: `{natr_1m:.2f}%` | 5m: `{natr_5m:.2f}%`\n\n"
+                            f"📋 Trigger: {signal_type.replace('_', ' ')}"
                         )
 
-                        print(f"   [SIGNAL] {tf_res} {symbol} -> {signal_side}")
-                        chart_file = generate_chart(res['df'], symbol, tf_res, signal_side)
+                        print(f"   [SIGNAL] {tf_res} {symbol} ({vol_info})")
+                        
+                        # Chart Title Info
+                        chart_extra = f"| Vol: {vol_info}"
+                        chart_file = generate_chart(res['df'], symbol, tf_res, chart_extra)
                         
                         if chart_file:
                             send_photo_sync(msg_caption, chart_file)
@@ -278,7 +314,7 @@ async def run_scanner_job(active_timeframes, do_market_report=False):
     print(f"✅ Selesai Scan {active_timeframes}")
 
 async def main_scheduler():
-    print("=== BOT MOMENTUM SCAN (Gainers/Losers) ===")
+    print("=== BOT FILTER ABNORMAL (High/Low Vol Only) ===")
     
     while True:
         now = datetime.now()
@@ -298,11 +334,8 @@ async def main_scheduler():
         active_tfs = ['5m']
         if run_minute % 15 == 0: active_tfs.append('15m')
         if run_minute % 30 == 0: active_tfs.append('30m')
-        
-        # Kirim laporan Top 50 setiap 1 jam (menit 00)
-        should_report_market = (run_minute == 0)
             
-        await run_scanner_job(active_tfs, do_market_report=should_report_market)
+        await run_scanner_job(active_tfs)
 
 if __name__ == "__main__":
     try:
