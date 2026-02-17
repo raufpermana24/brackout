@@ -12,8 +12,7 @@ from datetime import datetime, timedelta
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97')
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8562793193:AAHDulfzVhhnuPfNfy4Zk6ONBNSNbGwVJ8c')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003835878828
-')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003835878828')
 
 # Setting Scanner
 TIMEFRAME = '1h'       # Timeframe 1 Jam
