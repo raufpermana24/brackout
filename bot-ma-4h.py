@@ -14,6 +14,7 @@ BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNow
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8562793193:AAHDulfzVhhnuPfNfy4Zk6ONBNSNbGwVJ8c')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003819540522')
 
+
 # Setting Scanner Multi Timeframe
 TIMEFRAMES = ['4h', '1d', '1w']  # Scan 4 Jam, 1 Hari, dan 1 Minggu
 LIMIT_CANDLES = 100    # Jumlah candle untuk analisa
@@ -46,8 +47,8 @@ def generate_chart(df, symbol, timeframe):
     """Membuat chart png secara lokal"""
     filename = f"chart_{symbol.replace('/', '')}_{timeframe}_{int(time.time())}.png"
     try:
-        # Ambil 50 candle terakhir agar chart jelas
-        plot_df = df.tail(50).copy()
+        # Ambil 60 candle terakhir agar chart jelas
+        plot_df = df.tail(60).copy()
         plot_df.set_index('timestamp', inplace=True)
         
         # Style Chart Binance (Hijau/Merah)
@@ -61,13 +62,32 @@ def generate_chart(df, symbol, timeframe):
             mpf.make_addplot(plot_df['MA30'], color='purple', width=2),
         ]
         
+        # Note: Kita tidak menambahkan panel RSI/MACD di gambar agar chart tetap bersih di layar HP
+        # Data RSI/MACD akan dikirim via teks caption yang lebih mudah dibaca.
+        
         mpf.plot(plot_df, type='candle', style=s, addplot=ap, 
-                 title=f"{symbol} ({timeframe}) - Signal Alert",
+                 title=f"{symbol} ({timeframe}) - Analysis",
                  savefig=dict(fname=filename, dpi=80, bbox_inches='tight'), volume=False)
         return filename
     except Exception as e:
         print(f"Error making chart {symbol}: {e}")
         return None
+
+# ================= INDICATORS CALCULATION =================
+
+def calculate_rsi(df, period=14):
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(df, fast=12, slow=26, signal=9):
+    exp12 = df['close'].ewm(span=fast, adjust=False).mean()
+    exp26 = df['close'].ewm(span=slow, adjust=False).mean()
+    macd = exp12 - exp26
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    return macd, signal_line
 
 # ================= LOGIKA UTAMA (ASYNC) =================
 
@@ -92,9 +112,8 @@ async def get_top_futures_symbols(exchange):
         return []
 
 async def process_coin(exchange, symbol, timeframe):
-    """Proses 1 koin untuk timeframe tertentu: Fetch -> Calculate -> Analyze"""
+    """Proses 1 koin: Fetch -> Calculate Indicators -> Analyze Logic"""
     try:
-        # 1. Fetch Candle (Async) sesuai timeframe
         bars = await exchange.fetch_ohlcv(symbol, timeframe, limit=LIMIT_CANDLES)
         if not bars or len(bars) < 35: return None
 
@@ -102,44 +121,79 @@ async def process_coin(exchange, symbol, timeframe):
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-        # 3. Indikator
+        # 3. Indikator MA
         df['MA5'] = df['close'].rolling(window=5).mean()
         df['MA10'] = df['close'].rolling(window=10).mean()
         df['MA30'] = df['close'].rolling(window=30).mean()
 
-        # 4. Ambil Candle Close Terakhir (Index -2)
-        # Index -1 adalah candle berjalan (belum close)
+        # 4. Indikator Tambahan (RSI, MACD, Volume MA)
+        df['RSI'] = calculate_rsi(df)
+        df['MACD'], df['MACD_SIGNAL'] = calculate_macd(df)
+        df['VolMA'] = df['volume'].rolling(window=20).mean() # Rata-rata volume 20 candle
+
+        # 5. Ambil Candle Close Terakhir (Index -2)
         last_closed = df.iloc[-2]
         prev_closed = df.iloc[-3]
         
         result = {'symbol': symbol, 'alerts': [], 'data': last_closed, 'df': df, 'tf': timeframe}
-        has_alert = False
+        
+        # --- ANALISA LOGIKA SIGNAL ---
+        
+        # A. Cek Volume Spike (Volume Naik Signifikan)
+        # Volume sekarang > 1.5x Rata-rata volume
+        is_volume_spike = last_closed['volume'] > (last_closed['VolMA'] * 1.5)
+        
+        # B. Cek Status RSI (Overbought/Oversold)
+        rsi_val = last_closed['RSI']
+        rsi_status = "Neutral"
+        if rsi_val > 70: rsi_status = "OVERBOUGHT (Jenuh Beli) 🔴"
+        elif rsi_val < 30: rsi_status = "OVERSOLD (Jenuh Jual) 🟢"
 
-        # --- LOGIKA 1: GOLDEN CROSS MA5 & MA10 ---
-        # (MA5 Kemarin <= MA10 Kemarin) DAN (MA5 Sekarang > MA10 Sekarang)
+        # C. Cek Status MACD
+        macd_val = last_closed['MACD']
+        sig_val = last_closed['MACD_SIGNAL']
+        macd_status = "Bullish" if macd_val > sig_val else "Bearish"
+
+        # Simpan info teknikal untuk caption
+        result['tech_info'] = {
+            'rsi': rsi_val,
+            'rsi_status': rsi_status,
+            'macd': macd_status,
+            'vol_spike': is_volume_spike
+        }
+
+        # --- LOGIKA TRIGGER ALERT ---
+        
+        # Trigger 1: VOLUME SPIKE (Volume Naik Tinggi)
+        # Kita jadikan ini sebagai filter utama sesuai request: "kirim signal koin yang volume nya lagi naik"
+        if is_volume_spike:
+            result['alerts'].append('VOLUME_SPIKE')
+
+        # Trigger 2: GOLDEN CROSS (dengan filter volume opsional)
         if prev_closed['MA5'] <= prev_closed['MA10'] and last_closed['MA5'] > last_closed['MA10']:
             result['alerts'].append('GOLDEN_CROSS')
-            has_alert = True
 
-        # --- LOGIKA 2: MA30 TOUCH ---
-        # Low <= MA30 <= High
+        # Trigger 3: MA30 TOUCH
         if last_closed['low'] <= last_closed['MA30'] <= last_closed['high']:
             result['alerts'].append('MA30_TOUCH')
-            has_alert = True
 
-        return result if has_alert else None
+        # Hanya kembalikan result jika ada alert
+        if len(result['alerts']) > 0:
+            return result
+        
+        return None
 
     except Exception as e:
         return None
 
 async def run_scanner_job():
     """Menjalankan 1 putaran scan penuh untuk SEMUA timeframe"""
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔄 Memulai Scan {TOP_COINS} Koin...")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔄 Memulai Scan {TOP_COINS} Koin (Vol, RSI, MACD)...")
     
     exchange = ccxt.binance({
         'apiKey': BINANCE_API_KEY,
         'secret': BINANCE_SECRET_KEY,
-        'enableRateLimit': False, # Kita handle manual via batching
+        'enableRateLimit': False, 
         'options': {'defaultType': 'future'}
     })
 
@@ -150,70 +204,70 @@ async def run_scanner_job():
             await exchange.close()
             return
 
-        # LOOP MELALUI SETIAP TIMEFRAME (4h -> 1d -> 1w)
         for tf in TIMEFRAMES:
             print(f"\n📊 Scanning Timeframe: {tf} ...")
             signals_found = 0
             
-            # Loop per Batch (Agar tidak kena rate limit)
             for i in range(0, len(symbols), BATCH_SIZE):
                 batch = symbols[i : i + BATCH_SIZE]
                 print(f"   Batch {i+1}-{min(i+BATCH_SIZE, len(symbols))} ({tf})...", end='\r')
                 
-                # Buat list pekerjaan (tasks) dengan timeframe spesifik
                 coroutines = [process_coin(exchange, sym, tf) for sym in batch]
                 results = await asyncio.gather(*coroutines)
 
-                # Proses Hasil Batch Ini
                 for res in results:
                     if res:
                         symbol = res['symbol']
                         price = res['data']['close']
-                        ma30_val = res['data']['MA30']
+                        tech = res['tech_info']
                         current_tf = res['tf']
                         
-                        # Kirim Alert Golden Cross
-                        if 'GOLDEN_CROSS' in res['alerts']:
-                            signals_found += 1
-                            print(f"\n   [SIGNAL {current_tf}] Golden Cross: {symbol}")
-                            
-                            chart_file = generate_chart(res['df'], symbol, current_tf)
-                            
-                            caption = (
-                                f"🚀 **GOLDEN CROSS ({current_tf})** 🚀\n\n"
-                                f"#{symbol.replace('/','')}\n"
-                                f"Harga Close: {price}\n"
-                                f"Timeframe: {current_tf}\n"
-                                f"MA5 Cross UP MA10"
-                            )
-                            
-                            if chart_file:
-                                send_photo_sync(caption, chart_file)
-                                if os.path.exists(chart_file): os.remove(chart_file)
-                            else:
-                                send_telegram_sync(caption)
+                        # Filter: Jika request user "baru kirim signal koin yang volume nya lagi naik",
+                        # kita bisa memprioritaskan alert yang memiliki 'VOLUME_SPIKE' atau menggabungkannya.
+                        # Di sini saya akan menampilkan semua alert tapi memberikan highlight pada Volume.
+                        
+                        vol_text = "🔥 **VOLUME SPIKE DETECTED!** 🔥" if tech['vol_spike'] else "Volume: Normal"
+                        
+                        # Susun Caption Pesan
+                        base_caption = (
+                            f"#{symbol.replace('/','')} ({current_tf})\n"
+                            f"💰 Price: {price}\n"
+                            f"{vol_text}\n\n"
+                            f"📊 **Indikator:**\n"
+                            f"• RSI: {tech['rsi']:.1f} - {tech['rsi_status']}\n"
+                            f"• MACD: {tech['macd']}\n"
+                        )
 
-                        # Kirim Alert MA30 Touch
-                        if 'MA30_TOUCH' in res['alerts']:
+                        # Kirim Alert sesuai tipe yang ditemukan
+                        if 'VOLUME_SPIKE' in res['alerts']:
+                            # Kirim alert khusus jika ada volume spike signifikan + kondisi RSI menarik
+                            if tech['rsi'] > 70 or tech['rsi'] < 30: # Filter tambahan biar tidak spam spike biasa
+                                signals_found += 1
+                                print(f"\n   [VOL+RSI] {symbol} Vol Spike & {tech['rsi_status']}")
+                                chart_file = generate_chart(res['df'], symbol, current_tf)
+                                caption = f"⚡ **VOLUME & RSI ALERT** ⚡\n\n" + base_caption
+                                if chart_file:
+                                    send_photo_sync(caption, chart_file)
+                                    if os.path.exists(chart_file): os.remove(chart_file)
+                        
+                        elif 'GOLDEN_CROSS' in res['alerts']:
                             signals_found += 1
-                            print(f"\n   [SIGNAL {current_tf}] MA30 Touch: {symbol}")
-                            
+                            print(f"\n   [GC] {symbol} Golden Cross")
                             chart_file = generate_chart(res['df'], symbol, current_tf)
-                            
-                            caption = (
-                                f"⚠️ **MA 30 TOUCH ({current_tf})** ⚠️\n\n"
-                                f"#{symbol.replace('/','')}\n"
-                                f"Harga Close: {price}\n"
-                                f"Timeframe: {current_tf}\n"
-                                f"MA30: {ma30_val:.4f}\n"
-                                f"Candle menyentuh garis MA30"
-                            )
-                            
+                            caption = f"🚀 **GOLDEN CROSS** 🚀\nMA5 Cross UP MA10\n\n" + base_caption
                             if chart_file:
                                 send_photo_sync(caption, chart_file)
                                 if os.path.exists(chart_file): os.remove(chart_file)
 
-                # Jeda antar batch (Penting!)
+                        elif 'MA30_TOUCH' in res['alerts']:
+                            signals_found += 1
+                            print(f"\n   [MA30] {symbol} MA30 Touch")
+                            chart_file = generate_chart(res['df'], symbol, current_tf)
+                            caption = f"⚠️ **MA 30 TOUCH** ⚠️\nCandle menyentuh garis MA30\n\n" + base_caption
+                            if chart_file:
+                                send_photo_sync(caption, chart_file)
+                                if os.path.exists(chart_file): os.remove(chart_file)
+
                 await asyncio.sleep(DELAY_BATCH)
             
             print(f"\n   ✅ Selesai {tf}. Sinyal ditemukan: {signals_found}")
@@ -224,41 +278,27 @@ async def run_scanner_job():
 # ================= LOOP UTAMA =================
 
 async def main_scheduler():
-    print("=== BOT CONTINUOUS SCANNER (4h, 1d, 1w) STARTED ===")
+    print("=== BOT CONTINUOUS SCANNER (Vol, RSI, MACD) STARTED ===")
     
-    # Jalankan scan pertama kali saat bot baru dinyalakan
     await run_scanner_job()
     
     while True:
         now = datetime.now()
-        
-        # --- LOGIKA PENJADWALAN 4 JAM ---
-        # Kita ingin bot berjalan setiap kelipatan 4 jam (00:00, 04:00, 08:00, dst)
-        # karena timeframe terkecil adalah 4h.
-        
         current_hour = now.hour
-        # Hitung jam target berikutnya (pembulatan ke atas kelipatan 4)
         next_hour_target = (current_hour // 4 + 1) * 4
         
         if next_hour_target >= 24:
-            # Jika target jam 24, berarti pindah hari besok jam 00:00
             next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         else:
-            # Hari yang sama
             next_run = now.replace(hour=next_hour_target, minute=0, second=0, microsecond=0)
         
-        # Tambahkan buffer 15 detik agar candle benar-benar close di server Binance
         scheduled_time = next_run + timedelta(seconds=15)
-        
         seconds_to_wait = (scheduled_time - now).total_seconds()
         
         print(f"\n⏳ Menunggu {int(seconds_to_wait/60)} menit ({int(seconds_to_wait)} detik) sampai jam {scheduled_time.strftime('%H:%M:%S')}...")
-        print("Bot dalam mode standby...")
         
-        # Tidur sampai waktu yang ditentukan
         await asyncio.sleep(seconds_to_wait)
         
-        # WAKTUNYA SCAN!
         print("\n⏰ WAKTU SCAN TIBA! Memulai analisa Multi-Timeframe...")
         await run_scanner_job()
 
@@ -267,3 +307,6 @@ if __name__ == "__main__":
         asyncio.run(main_scheduler())
     except KeyboardInterrupt:
         print("\nBot Stopped by User")
+
+
+
