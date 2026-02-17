@@ -62,7 +62,7 @@ def generate_chart(df, symbol):
         ]
         
         mpf.plot(plot_df, type='candle', style=s, addplot=ap, 
-                 title=f"{symbol} ({TIMEFRAME}) - MA30 Alert",
+                 title=f"{symbol} ({TIMEFRAME}) - MA Alert",
                  savefig=dict(fname=filename, dpi=80, bbox_inches='tight'), volume=False)
         return filename
     except Exception as e:
@@ -169,24 +169,37 @@ async def run_scanner_job():
                     price = res['data']['close']
                     ma30_val = res['data']['MA30']
                     
-                    # Kirim Alert Golden Cross
+                    # Kirim Alert Golden Cross (SEKARANG PAKAI FOTO)
                     if 'GOLDEN_CROSS' in res['alerts']:
                         signals_found += 1
                         print(f"\n[SIGNAL] Golden Cross: {symbol}")
-                        msg = (
+                        
+                        # Buat Chart
+                        chart_file = generate_chart(res['df'], symbol)
+                        
+                        caption = (
                             f"🚀 **GOLDEN CROSS CONFIRMED** 🚀\n\n"
                             f"#{symbol.replace('/','')}\n"
                             f"Harga Close: {price}\n"
                             f"Timeframe: {TIMEFRAME}\n"
                             f"MA5 Cross UP MA10"
                         )
-                        send_telegram_sync(msg)
+                        
+                        if chart_file:
+                            send_photo_sync(caption, chart_file)
+                            # Hapus file setelah kirim
+                            if os.path.exists(chart_file): os.remove(chart_file)
+                        else:
+                            # Fallback jika gagal generate chart, kirim teks saja
+                            send_telegram_sync(caption)
 
-                    # Kirim Alert MA30 Touch
+                    # Kirim Alert MA30 Touch (PAKAI FOTO)
                     if 'MA30_TOUCH' in res['alerts']:
                         signals_found += 1
                         print(f"\n[SIGNAL] MA30 Touch: {symbol}")
+                        
                         chart_file = generate_chart(res['df'], symbol)
+                        
                         caption = (
                             f"⚠️ **MA 30 TOUCH CONFIRMED** ⚠️\n\n"
                             f"#{symbol.replace('/','')}\n"
@@ -194,6 +207,7 @@ async def run_scanner_job():
                             f"MA30: {ma30_val:.4f}\n"
                             f"Candle menyentuh garis MA30"
                         )
+                        
                         if chart_file:
                             send_photo_sync(caption, chart_file)
                             if os.path.exists(chart_file): os.remove(chart_file)
@@ -218,11 +232,9 @@ async def main_scheduler():
         now = datetime.now()
         
         # Hitung waktu menuju jam berikutnya (Next Hour : Minute 00 : Second 00)
-        # Contoh: Jika sekarang 13:15, next run adalah 14:00
         next_run = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         
         # Tambahkan buffer 10 detik agar candle benar-benar close di server Binance
-        # Jadi kita mulai scan jam 14:00:10
         scheduled_time = next_run + timedelta(seconds=10)
         
         seconds_to_wait = (scheduled_time - now).total_seconds()
@@ -242,5 +254,3 @@ if __name__ == "__main__":
         asyncio.run(main_scheduler())
     except KeyboardInterrupt:
         print("\nBot Stopped by User")
-
-
