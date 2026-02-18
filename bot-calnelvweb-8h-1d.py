@@ -5,6 +5,8 @@ import mplfinance as mpf
 import requests
 import os
 import time
+import json
+import websockets # Pastikan install: pip install websockets
 from datetime import datetime
 
 # --- KONFIGURASI ENV ---
@@ -26,6 +28,8 @@ TOP_COUNT = 100
 DELAY_SEND = 5
 # Timeframe untuk Chart
 CHART_TIMEFRAME = '1d' 
+# URL WebSocket Binance Futures (All Market Ticker)
+WS_URL = "wss://fstream.binance.com/ws/!ticker@arr"
 
 async def get_exchange():
     return ccxt.binance({
@@ -62,50 +66,54 @@ def generate_chart_image(symbol, change_pct, df, rank_num, rank_type):
         plot_df = df.tail(60).copy()
         if len(plot_df) == 0: return None
         
-        # Fix Volume Ylim Singular Warning & Zero-size array error
+        # Fix Volume Ylim Singular Warning
         plot_df['volume'] = plot_df['volume'].fillna(0)
         
         vol_min = plot_df['volume'].min()
         vol_max = plot_df['volume'].max()
         
         show_volume = True
-        # If min == max (e.g. all 0), disable volume
         if vol_min == vol_max: 
             show_volume = False
         
-        # Konfigurasi Panel Dinamis
-        if show_volume:
-            rsi_panel = 2
-            p_ratios = (6, 2, 2)
-            vol_panel = 1
-        else:
-            rsi_panel = 1
-            p_ratios = (6, 2)
-            # FIX: Set dummy int '1' karena validator mplfinance menolak None
-            vol_panel = 1 
-        
-        # --- Dinamis AddPlot (Fix Zero-size array error) ---
-        # Hanya tambahkan indikator jika datanya valid (tidak NaN semua)
-        apd = []
-        
+        # Helper check
         def has_valid_data(series):
             return series.notna().any()
 
-        # MA5
+        valid_rsi = has_valid_data(plot_df['RSI'])
+
+        # Konfigurasi Panel Dinamis
+        if show_volume:
+            vol_panel = 1
+            if valid_rsi:
+                rsi_panel = 2
+                p_ratios = (6, 2, 2)
+            else:
+                rsi_panel = None
+                p_ratios = (6, 2)
+        else:
+            vol_panel = 1 
+            if valid_rsi:
+                rsi_panel = 1
+                p_ratios = (6, 2)
+            else:
+                rsi_panel = None
+                p_ratios = None 
+        
+        # --- Dinamis AddPlot ---
+        apd = []
+
         if has_valid_data(plot_df['MA5']):
             apd.append(mpf.make_addplot(plot_df['MA5'], color='blue', width=0.8, panel=0))
             
-        # MA100 (Sering error di sini jika data < 100 candle)
         if has_valid_data(plot_df['MA100']):
             apd.append(mpf.make_addplot(plot_df['MA100'], color='black', width=1.2, panel=0))
             
-        # Bollinger Bands
         if has_valid_data(plot_df['BB_Upper']) and has_valid_data(plot_df['BB_Lower']):
             apd.append(mpf.make_addplot(plot_df['BB_Upper'], color='gray', linestyle='--', width=0.5, panel=0))
             apd.append(mpf.make_addplot(plot_df['BB_Lower'], color='gray', linestyle='--', width=0.5, panel=0))
             
-        # RSI
-        if has_valid_data(plot_df['RSI']):
+        if valid_rsi and rsi_panel is not None:
             apd.append(mpf.make_addplot(plot_df['RSI'], panel=rsi_panel, color='purple', ylabel='RSI', width=1.5))
             apd.append(mpf.make_addplot([70]*len(plot_df), panel=rsi_panel, color='red', linestyle='--', width=0.5))
             apd.append(mpf.make_addplot([30]*len(plot_df), panel=rsi_panel, color='green', linestyle='--', width=0.5))
@@ -115,13 +123,21 @@ def generate_chart_image(symbol, change_pct, df, rank_num, rank_type):
         
         title = f"\n#{rank_num} {rank_type}: {symbol}\nChange 24H: {change_pct:+.2f}%"
         
-        mpf.plot(
-            plot_df, type='candle', style=s, addplot=apd,
-            title=title, ylabel='Price', 
-            volume=show_volume, volume_panel=vol_panel, 
-            panel_ratios=p_ratios, 
-            savefig=file_path
-        )
+        plot_args = {
+            'type': 'candle', 
+            'style': s, 
+            'addplot': apd,
+            'title': title, 
+            'ylabel': 'Price', 
+            'volume': show_volume, 
+            'volume_panel': vol_panel, 
+            'savefig': file_path
+        }
+        
+        if p_ratios:
+            plot_args['panel_ratios'] = p_ratios
+
+        mpf.plot(plot_df, **plot_args)
         return file_path
     
     except Exception as e:
@@ -139,6 +155,7 @@ async def send_telegram_photo(file_path, caption):
     except Exception as e:
         print(f"❌ Error Telegram: {e}")
 
+# --- METODE 1: AMBIL DATA PAKE REST API (SAFE FALLBACK) ---
 async def fetch_ohlcv_safe(exchange, symbol, timeframe):
     max_retries = 3
     for i in range(max_retries):
@@ -178,6 +195,7 @@ async def process_and_send_list(exchange, sorted_list, rank_type_label):
         print(f"[{i}/{total}] Mengambil data history {symbol}...")
         
         try:
+            # Menggunakan REST API untuk history candle (wajib untuk chart)
             ohlcv = await fetch_ohlcv_safe(exchange, symbol, CHART_TIMEFRAME)
             
             if ohlcv:
@@ -213,53 +231,117 @@ async def process_and_send_list(exchange, sorted_list, rank_type_label):
             print(f"Error processing {symbol}: {e}")
             await asyncio.sleep(1) 
 
+# --- METODE 2: SNAPSHOT PAKE WEBSOCKET (UTAMA) ---
+async def get_snapshot_websocket():
+    """
+    Mengambil data snapshot pasar menggunakan WebSocket.
+    Lebih cepat dan tidak memakan kuota REST API.
+    """
+    print("🔌 Mencoba mengambil snapshot via WebSocket...")
+    try:
+        # Connect dan tunggu 1 pesan saja (snapshot)
+        async with websockets.connect(WS_URL) as websocket:
+            # Timeout 10 detik, jika macet langsung pindah ke REST
+            msg = await asyncio.wait_for(websocket.recv(), timeout=10)
+            data = json.loads(msg)
+            
+            market_data = []
+            for ticker in data:
+                symbol_raw = ticker['s'] # Format: BTCUSDT
+                
+                # Filter hanya USDT Futures
+                if not symbol_raw.endswith('USDT'): continue
+                
+                # Format ulang simbol ke ccxt format: BTC/USDT
+                symbol_ccxt = f"{symbol_raw[:-4]}/{symbol_raw[-4:]}"
+                
+                # Ambil data percentage dan last price
+                pct = float(ticker['P']) # P = Price change percent
+                price = float(ticker['c']) # c = Last price
+                
+                # LOGIKA FILTER
+                if abs(pct) < MIN_CHANGE_THRESHOLD:
+                    continue
+                
+                market_data.append({
+                    'symbol': symbol_ccxt,
+                    'pct': pct,
+                    'price': price
+                })
+            
+            print(f"✅ WebSocket Snapshot Berhasil! {len(market_data)} koin lolos filter.")
+            return market_data
+
+    except Exception as e:
+        print(f"⚠️ WebSocket Gagal/Timeout: {e}")
+        return None
+
+# --- METODE 3: SNAPSHOT PAKE REST API (CADANGAN) ---
+async def get_snapshot_rest(exchange):
+    """
+    Mengambil data snapshot pasar menggunakan REST API (Fetch Tickers).
+    Digunakan jika WebSocket gagal.
+    """
+    print("⚠️ Beralih ke metode REST API (Fetch Tickers)...")
+    try:
+        tickers = await exchange.fetch_tickers()
+        market_data = []
+        for symbol, ticker in tickers.items():
+            if '/USDT' in symbol: 
+                pct = ticker['percentage'] if ticker['percentage'] else 0.0
+                
+                if abs(pct) < MIN_CHANGE_THRESHOLD:
+                    continue 
+                
+                market_data.append({
+                    'symbol': symbol,
+                    'pct': pct,
+                    'price': ticker['last']
+                })
+        print(f"✅ REST API Snapshot Berhasil! {len(market_data)} koin lolos filter.")
+        return market_data
+    except Exception as e:
+        print(f"❌ REST API Snapshot Gagal: {e}")
+        return []
+
 async def run_chart_ranker():
     exchange = await get_exchange()
-    print(f"🤖 Bot Chart Ranker Filtered Berjalan...")
+    print(f"🤖 Bot Hybrid (WS + REST) Berjalan...")
     print(f"🛡️ Syarat Lolos: Persentase >= {MIN_CHANGE_THRESHOLD}% atau <= -{MIN_CHANGE_THRESHOLD}%")
-    print(f"🎯 Target Maksimal: Top {TOP_COUNT} Gainers & {TOP_COUNT} Losers dari hasil filter")
+    print(f"🎯 Target Maksimal: Top {TOP_COUNT} Gainers & {TOP_COUNT} Losers")
     
     try:
         while True:
-            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 📥 Mengambil Snapshot Pasar...")
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 📥 Memulai Siklus Scan...")
             
-            tickers = await exchange.fetch_tickers()
+            # 1. COBA AMBIL DATA PAKE WEBSOCKET
+            market_data = await get_snapshot_websocket()
             
-            market_data = []
-            for symbol, ticker in tickers.items():
-                if '/USDT' in symbol: 
-                    pct = ticker['percentage'] if ticker['percentage'] else 0.0
-                    
-                    # --- LOGIKA FILTER KETAT ---
-                    # Jika pct ada di range "tanggung" (misal -1.5 atau 0.5 atau 2.0) -> SKIP
-                    if abs(pct) < MIN_CHANGE_THRESHOLD:
-                        continue 
-                    
-                    # Jika lolos (>= 2.5 atau <= -2.5), simpan!
-                    market_data.append({
-                        'symbol': symbol,
-                        'pct': pct,
-                        'price': ticker['last']
-                    })
+            # 2. JIKA WEBSOCKET ERROR/KOSONG, AMBIL PAKE REST API
+            if market_data is None:
+                market_data = await get_snapshot_rest(exchange)
             
+            if not market_data:
+                print("❌ Gagal mengambil data pasar dari kedua metode. Tidur 1 menit lalu coba lagi.")
+                await asyncio.sleep(60)
+                continue
+
             print(f"📊 Total Koin Lolos Filter (+/- {MIN_CHANGE_THRESHOLD}%): {len(market_data)} koin.")
             
-            # Pisahkan Gainer dan Loser dari data yang sudah difilter
+            # Pisahkan Gainer dan Loser
             gainers_only = [x for x in market_data if x['pct'] > 0]
             losers_only = [x for x in market_data if x['pct'] < 0]
 
-            # 2. SORTING
-            # Sort Gainer (Besar ke Kecil)
+            # 3. SORTING DI MEMORY
             sorted_gainers = sorted(gainers_only, key=lambda x: x['pct'], reverse=True)
-            # Ambil Top N (misal 100) dari yg lolos filter
             final_gainers = sorted_gainers[:TOP_COUNT]
             
-            # Sort Loser (Kecil ke Besar / Minus paling dalam)
             sorted_losers = sorted(losers_only, key=lambda x: x['pct'])
-            # Ambil Top N (misal 100) dari yg lolos filter
             final_losers = sorted_losers[:TOP_COUNT]
             
-            # 3. PROSES PENGIRIMAN
+            # 4. PROSES PENGIRIMAN
+            # Catatan: Di dalam fungsi ini, kita menggunakan REST API (fetch_ohlcv_safe)
+            # karena WebSocket Ticker tidak menyediakan history candle untuk chart.
             await process_and_send_list(exchange, final_gainers, "TOP GAINER")
             
             print("\n✅ Gainers Selesai. Istirahat 10 detik...\n")
