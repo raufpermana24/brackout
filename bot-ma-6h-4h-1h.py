@@ -13,10 +13,13 @@ import traceback
 from datetime import datetime
 
 # ================= KONFIGURASI =================
-BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97')
-BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8562793193:AAHDulfzVhhnuPfNfy4Zk6ONBNSNbGwVJ8c')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003819540522')
+API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97')
+API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
+
+
+# Telegram Config (Isi manual jika tidak pakai env var)
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003726025593')
 
 # Setting Scanner
 TOP_COINS = 40          # Pantau 40 Koin Teratas (Agar koneksi stabil)
@@ -354,21 +357,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\nBot Stopped")
-
-
-Penjelasan Logika Hybrid pada Kode handle_signal_alert:
-Bagian terpenting ada di fungsi handle_signal_alert (baris 186):
-Delay 5 Detik: await asyncio.sleep(SEND_DELAY) dipanggil pertama kali.
-Percobaan 1 (WebSocket Data):
-chart_file = await loop.run_in_executor(None, generate_chart, df, ...)
-Bot mencoba membuat chart dari df (data yang dikumpul dari WebSocket).
-Pengecekan Error: Jika chart_file is None (berarti data WS tidak cukup atau corrupt).
-Percobaan 2 (REST API Fallback):
-if chart_file is None:
-    log("...Mencoba REST API...")
-    df_fallback = await fetch_data_fallback(symbol, timeframe)
-    chart_file = await loop.run_in_executor(None, generate_chart, df_fallback, ...)
-
-
-
-
