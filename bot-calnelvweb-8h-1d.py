@@ -68,6 +68,7 @@ def generate_chart_image(symbol, change_pct, df, rank_num, rank_type):
         show_volume = True
         if vol_min == vol_max: show_volume = False
         
+        # Konfigurasi Panel Dinamis
         if show_volume:
             rsi_panel = 2
             p_ratios = (6, 2, 2)
@@ -75,7 +76,10 @@ def generate_chart_image(symbol, change_pct, df, rank_num, rank_type):
         else:
             rsi_panel = 1
             p_ratios = (6, 2)
-            vol_panel = None
+            # FIX: Validator mplfinance menolak 'None'. 
+            # Kita set ke integer 1. Saat volume=False, ini tidak akan digambar, 
+            # tapi validator akan puas karena nilainya integer.
+            vol_panel = 1 
         
         apd = [
             mpf.make_addplot(plot_df['MA5'], color='blue', width=0.8, panel=0),
