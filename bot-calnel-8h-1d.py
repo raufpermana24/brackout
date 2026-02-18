@@ -5,9 +5,10 @@ import mplfinance as mpf
 import requests
 import os
 import time
+import random
 from datetime import datetime, timedelta
 
-# --- KONFIGURASI API ---
+# --- KONFIGURASI ENV ---
 API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97')
 API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
 
@@ -16,34 +17,29 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9Q
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003726025593')
 
 
-# --- SETTING SCANNER ---
-TARGET_PERCENT = 2.5       # Target: Body candle minimal 2.5%
-TIMEFRAMES = ['8h', '1d']  # Timeframe yang dipantau
-LIMIT_CANDLES = 200        # Ambil 200 data (aman untuk MA100)
-MAX_CONCURRENT_REQ = 10    # Batas koneksi parallel
+# --- PENGATURAN KEAMANAN EKSTRA ---
+TARGET_PERCENT = 2.5      
+TIMEFRAMES = ['8h', '1d'] 
+LIMIT_CANDLES = 150       
 
-# --- MEMORY DATABASE ---
-# Menyimpan timestamp candle yang sudah dilaporkan agar tidak dikirim ulang
-# Format: {(Symbol, Timeframe): Timestamp_Candle}
+# [ULTRA SAFE CONFIG]
+# Kurangi drastis kecepatan agar tidak dibanned
+BATCH_SIZE = 5       # Hanya 5 request per batch
+BATCH_DELAY = 4      # Istirahat 4 detik antar batch
+
+# Memory
 PROCESSED_CANDLES = {}
 
-async def get_exchange():
+async def init_exchange():
     return ccxt.binance({
         'apiKey': API_KEY,
         'secret': API_SECRET,
-        'enableRateLimit': True,
+        'enableRateLimit': True, 
         'options': {'defaultType': 'future'}
     })
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/period, adjust=False).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-def add_indicators(df):
-    # Moving Averages
+# --- FUNGSI INDIKATOR & CHART ---
+def calculate_indicators(df):
     df['MA5'] = df['close'].rolling(window=5).mean()
     df['MA10'] = df['close'].rolling(window=10).mean()
     df['MA30'] = df['close'].rolling(window=30).mean()
@@ -56,21 +52,22 @@ def add_indicators(df):
     df['BB_Lower'] = df['BB_Mid'] - (2 * df['BB_Std'])
     
     # RSI
-    df['RSI'] = calculate_rsi(df['close'])
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
-def send_telegram_alert(symbol, timeframe, change_pct, open_p, close_p, candle_time, df):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+def send_telegram_alert(symbol, timeframe, change_pct, open_p, close_p, candle_ts, df):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
 
     clean_symbol = symbol.replace('/', '').replace(':', '')
-    file_path = f"alert_{clean_symbol}_{timeframe}.png"
+    file_path = f"safe_alert_{clean_symbol}_{timeframe}.png"
     
     try:
-        # Visualisasi 60 candle terakhir
         plot_df = df.tail(60)
         
-        # Konfigurasi Tampilan Chart
         apd = [
             mpf.make_addplot(plot_df['MA5'], color='blue', width=0.8, panel=0),
             mpf.make_addplot(plot_df['MA10'], color='orange', width=0.8, panel=0),
@@ -86,33 +83,26 @@ def send_telegram_alert(symbol, timeframe, change_pct, open_p, close_p, candle_t
         mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', edge='inherit', wick='inherit', volume='in')
         s  = mpf.make_mpf_style(marketcolors=mc, gridstyle='--', y_on_right=True)
         
-        # Judul Chart
-        title_text = f"\n{symbol} [{timeframe.upper()}] CLOSED\nBody Change: {change_pct:+.2f}%"
-        
         mpf.plot(
             plot_df, type='candle', style=s, addplot=apd,
-            title=title_text, ylabel='Price', 
-            volume=True, volume_panel=1, panel_ratios=(6, 2, 2), 
+            title=f"\n{symbol} [{timeframe.upper()}] CLOSED\nBody: {change_pct:+.2f}%",
+            ylabel='Price', volume=True, volume_panel=1, panel_ratios=(6, 2, 2), 
             savefig=file_path
         )
 
-        # Siapkan Caption Telegram
-        trend = "LONG/BUY 🟢" if change_pct > 0 else "SHORT/SELL 🔴"
-        rsi_val = df['RSI'].iloc[-2] # RSI saat candle close
+        trend = "🟢 BULLISH" if change_pct > 0 else "🔴 BEARISH"
+        rsi_val = df['RSI'].iloc[-2]
         
         caption = (
-            f"🔔 **CANDLE CLOSED ALERT** 🔔\n\n"
-            f"{trend}\n"
-            f"Symbol: `#{clean_symbol}`\n"
+            f"🛡️ **SAFE SCAN ALERT** 🛡️\n\n"
+            f"{trend} CLOSE\n"
+            f"Coin: `#{clean_symbol}`\n"
             f"Timeframe: **{timeframe.upper()}**\n"
-            f"Time: {candle_time}\n\n"
-            f"📊 **Candle Data:**\n"
+            f"Time: {candle_ts}\n\n"
             f"Open: `{open_p}`\n"
             f"Close: `{close_p}`\n"
-            f"Change: **{change_pct:+.2f}%**\n\n"
-            f"📈 **Indicator:**\n"
+            f"Change: **{change_pct:+.2f}%**\n"
             f"RSI: {rsi_val:.1f}\n"
-            f"Vol: {df['volume'].iloc[-2]:.0f}"
         )
         
         with open(file_path, 'rb') as photo:
@@ -120,137 +110,141 @@ def send_telegram_alert(symbol, timeframe, change_pct, open_p, close_p, candle_t
             data = {'chat_id': TELEGRAM_CHAT_ID, 'caption': caption, 'parse_mode': 'Markdown'}
             requests.post(url, files={'photo': photo}, data=data)
             
-        print(f"✅ Alert sent for {symbol} ({timeframe})")
+        print(f"🚀 Signal sent: {symbol}")
+    except Exception as e:
+        print(f"Error Telegram: {e}")
+    finally:
+        if os.path.exists(file_path): os.remove(file_path)
+
+async def fetch_ohlcv_safe(exchange, symbol, timeframe):
+    """
+    Mengambil data dengan penanganan Error 418/429 yang ketat.
+    """
+    try:
+        # Ambil data
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=LIMIT_CANDLES)
+        return ohlcv
+    
+    except ccxt.DDoSProtection as e:
+        print(f"\n⛔ DDoS Protection Triggered: {e}")
+        print("Tidur 2 menit...")
+        await asyncio.sleep(120)
+        return None
+        
+    except ccxt.RateLimitExceeded as e:
+        print(f"\n⛔ Rate Limit Hit pada {symbol}! Tidur 1 menit...")
+        await asyncio.sleep(60)
+        return None
+        
+    except (ccxt.NetworkError, ccxt.ExchangeError) as e:
+        # Cek pesan error string untuk kode 418/429 jika exception class tidak tertangkap
+        err_msg = str(e).lower()
+        if '418' in err_msg or '429' in err_msg or 'banned' in err_msg:
+            print(f"\n💀 CRITICAL BAN DETECTED: {e}")
+            print("🛑 Bot akan tidur selama 60 MENIT untuk pendinginan IP.")
+            await asyncio.sleep(3600) # Tidur 1 Jam
+            return None
+            
+        # Error ringan (timeout dll), abaikan saja untuk koin ini
+        return None
         
     except Exception as e:
-        print(f"❌ Error sending image: {e}")
-    finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        return None
 
-async def process_coin(exchange, semaphore, symbol, timeframe):
-    async with semaphore:
-        try:
-            # 1. Ambil Data OHLCV
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=LIMIT_CANDLES)
-            if not ohlcv or len(ohlcv) < 100: return None
+async def process_coin_logic(exchange, symbol, timeframe):
+    ohlcv = await fetch_ohlcv_safe(exchange, symbol, timeframe)
+    
+    if not ohlcv or len(ohlcv) < 100: return None
 
-            # 2. Buat DataFrame
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-            df.set_index('timestamp', inplace=True)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
 
-            # ---------------------------------------------------------
-            # LOGIKA UTAMA: MENGHITUNG BODY CANDLE YANG SUDAH CLOSED
-            # ---------------------------------------------------------
-            
-            # iloc[-1] = Candle yang sedang berjalan (Running/Unfinished)
-            # iloc[-2] = Candle yang sudah selesai (Closed/Final)
-            
-            closed_candle = df.iloc[-2]
-            
-            # Ambil timestamp candle tersebut (Waktu Open candle)
-            candle_ts = closed_candle.name 
-            
-            # CEK IDEMPOTENCY: Apakah candle ini sudah pernah dikirim?
-            mem_key = (symbol, timeframe)
-            if mem_key in PROCESSED_CANDLES:
-                if PROCESSED_CANDLES[mem_key] == candle_ts:
-                    return None # Sudah dikirim, skip!
+    closed_candle = df.iloc[-2]
+    candle_ts = closed_candle.name
+    
+    # Idempotency Check
+    key = (symbol, timeframe)
+    if key in PROCESSED_CANDLES:
+        if PROCESSED_CANDLES[key] == candle_ts:
+            return None 
 
-            # Ambil Harga OPEN dan CLOSE dari candle yang sudah closed
-            open_price = float(closed_candle['open'])
-            close_price = float(closed_candle['close'])
-            
-            if open_price == 0: return None
+    open_p = float(closed_candle['open'])
+    close_p = float(closed_candle['close'])
+    
+    if open_p == 0: return None
+    change_pct = ((close_p - open_p) / open_p) * 100
 
-            # HITUNG PERSENTASE (Body Candle)
-            # Rumus: ((Close - Open) / Open) * 100
-            change_pct = ((close_price - open_price) / open_price) * 100
-
-            # ---------------------------------------------------------
-
-            # Cek apakah memenuhi target 2.5%
-            if abs(change_pct) >= TARGET_PERCENT:
-                
-                # Hitung indikator untuk visualisasi chart
-                df = add_indicators(df)
-                
-                # Return data lengkap untuk dikirim
-                return {
-                    'symbol': symbol,
-                    'tf': timeframe,
-                    'pct': change_pct,
-                    'open': open_price,
-                    'close': close_price,
-                    'time': candle_ts,
-                    'df': df
-                }
-            
-            # Jika tidak sinyal, tetap simpan timestamp agar tidak dicek ulang (Opsional)
-            # PROCESSED_CANDLES[mem_key] = candle_ts 
-
-        except Exception as e:
-            # Error connection, skip
-            return None
+    if abs(change_pct) >= TARGET_PERCENT:
+        df = calculate_indicators(df)
+        return {
+            'symbol': symbol, 'tf': timeframe, 'pct': change_pct,
+            'open': open_p, 'close': close_p, 'time': candle_ts, 'df': df
+        }
     return None
 
-async def scanner_job():
-    exchange = await get_exchange()
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔍 Scanning Closed Candles...")
+async def run_bot():
+    print("🤖 Menginisialisasi Bot Ultra Safe...")
+    exchange = await init_exchange()
     
     try:
+        # 1. Load Markets SEKALI SAJA di awal
+        print("📥 Loading markets data...")
         markets = await exchange.load_markets()
         symbols = [s for s in markets if '/USDT' in s]
+        print(f"📊 Total Pair: {len(symbols)}")
         
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQ)
-        tasks = []
-
-        # Buat task untuk setiap koin & setiap timeframe
-        for sym in symbols:
-            for tf in TIMEFRAMES:
-                tasks.append(process_coin(exchange, semaphore, sym, tf))
-        
-        # Jalankan parallel
-        results = await asyncio.gather(*tasks)
-        
-        # Filter hasil yang None
-        valid_signals = [r for r in results if r is not None]
-        print(f"found {len(valid_signals)} signals.")
-
-        for signal in valid_signals:
-            # Kirim Telegram
-            send_telegram_alert(
-                symbol=signal['symbol'],
-                timeframe=signal['tf'],
-                change_pct=signal['pct'],
-                open_p=signal['open'],
-                close_p=signal['close'],
-                candle_time=signal['time'],
-                df=signal['df']
-            )
+        while True:
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🛡️ Memulai Siklus Scan...")
             
-            # Update Memory: Tandai candle ini sudah diproses
-            key = (signal['symbol'], signal['tf'])
-            PROCESSED_CANDLES[key] = signal['time']
+            # Buat Task List
+            all_tasks = []
+            for sym in symbols:
+                for tf in TIMEFRAMES:
+                    all_tasks.append((sym, tf))
             
-            time.sleep(1) # Delay pengiriman
+            total_tasks = len(all_tasks)
+            
+            # --- BATCH PROCESSING ---
+            for i in range(0, total_tasks, BATCH_SIZE):
+                batch = all_tasks[i : i + BATCH_SIZE]
+                
+                coroutines = [process_coin_logic(exchange, sym, tf) for sym, tf in batch]
+                results = await asyncio.gather(*coroutines)
+                
+                valid_signals = [r for r in results if r is not None]
+                for sig in valid_signals:
+                    send_telegram_alert(
+                        sig['symbol'], sig['tf'], sig['pct'], 
+                        sig['open'], sig['close'], sig['time'], sig['df']
+                    )
+                    PROCESSED_CANDLES[(sig['symbol'], sig['tf'])] = sig['time']
+                
+                # Progress Log
+                print(f"✅ Batch {i}/{total_tasks} ok. Sleep {BATCH_DELAY}s...", end='\r')
+                
+                # JEDA PENTING: Randomize delay agar terlihat natural
+                sleep_time = BATCH_DELAY + random.uniform(0, 1) 
+                await asyncio.sleep(sleep_time)
+                
+            print(f"\n🏁 Siklus Selesai. Menunggu 5 menit...")
+            
+            # Tunggu 5 menit sebelum scan ulang
+            await asyncio.sleep(300)
 
     except Exception as e:
-        print(f"Critical error: {e}")
+        print(f"Critical System Error: {e}")
     finally:
         await exchange.close()
 
 if __name__ == "__main__":
-    print("🤖 Bot Active: Scanning Close Prices (Index -2)")
-    print(f"Target: +/- {TARGET_PERCENT}% Body Candle")
+    print("🛡️ Bot Anti-Ban Mode Aktif")
+    print(f"📦 Batch Size: {BATCH_SIZE} | Delay: {BATCH_DELAY}s")
     
-    while True:
-        asyncio.run(scanner_job())
-        
-        # Interval Scan: 5 Menit (300 detik)
-        # Aman karena kita menggunakan filter timestamp (tidak akan double post)
-        print("⏳ Waiting 5 minutes...")
-        time.sleep(300)
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        print("\nBot dimatikan pengguna.")
+
 
 
