@@ -19,8 +19,7 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003726025593')
 # Filter Persentase Minimum (Hanya kirim jika >= 2.5 atau <= -2.5)
 MIN_CHANGE_THRESHOLD = 2.5
 
-# Jumlah Maksimal Top Koin yang dikirim (untuk mencegah spam jika market sedang volatile sekali)
-# Bot akan mengambil koin yang lolos filter, lalu mengirim maksimal 100 teratas dari list tersebut.
+# Jumlah Maksimal Top Koin yang dikirim
 TOP_COUNT = 100 
 
 # Jeda antar pengiriman gambar (5 detik)
@@ -38,7 +37,7 @@ async def get_exchange():
 
 # --- FUNGSI CHART & INDIKATOR ---
 def generate_chart_image(symbol, change_pct, df, rank_num, rank_type):
-    if df is None or len(df) < 50: return None
+    if df is None or len(df) < 1: return None
 
     clean_symbol = symbol.replace('/', '')
     file_path = f"rank_{rank_num}_{clean_symbol}.png"
@@ -60,13 +59,19 @@ def generate_chart_image(symbol, change_pct, df, rank_num, rank_type):
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         df['RSI'] = 100 - (100 / (1 + (gain / loss)))
 
-        plot_df = df.tail(60)
+        plot_df = df.tail(60).copy()
+        if len(plot_df) == 0: return None
         
-        # Fix Volume Ylim Singular Warning
+        # Fix Volume Ylim Singular Warning & Zero-size array error
+        plot_df['volume'] = plot_df['volume'].fillna(0)
+        
         vol_min = plot_df['volume'].min()
         vol_max = plot_df['volume'].max()
+        
         show_volume = True
-        if vol_min == vol_max: show_volume = False
+        # If min == max (e.g. all 0), disable volume
+        if vol_min == vol_max: 
+            show_volume = False
         
         # Konfigurasi Panel Dinamis
         if show_volume:
@@ -76,20 +81,34 @@ def generate_chart_image(symbol, change_pct, df, rank_num, rank_type):
         else:
             rsi_panel = 1
             p_ratios = (6, 2)
-            # FIX: Validator mplfinance menolak 'None'. 
-            # Kita set ke integer 1. Saat volume=False, ini tidak akan digambar, 
-            # tapi validator akan puas karena nilainya integer.
+            # FIX: Set dummy int '1' karena validator mplfinance menolak None
             vol_panel = 1 
         
-        apd = [
-            mpf.make_addplot(plot_df['MA5'], color='blue', width=0.8, panel=0),
-            mpf.make_addplot(plot_df['MA100'], color='black', width=1.2, panel=0),
-            mpf.make_addplot(plot_df['BB_Upper'], color='gray', linestyle='--', width=0.5, panel=0),
-            mpf.make_addplot(plot_df['BB_Lower'], color='gray', linestyle='--', width=0.5, panel=0),
-            mpf.make_addplot(plot_df['RSI'], panel=rsi_panel, color='purple', ylabel='RSI', width=1.5),
-            mpf.make_addplot([70]*len(plot_df), panel=rsi_panel, color='red', linestyle='--', width=0.5),
-            mpf.make_addplot([30]*len(plot_df), panel=rsi_panel, color='green', linestyle='--', width=0.5),
-        ]
+        # --- Dinamis AddPlot (Fix Zero-size array error) ---
+        # Hanya tambahkan indikator jika datanya valid (tidak NaN semua)
+        apd = []
+        
+        def has_valid_data(series):
+            return series.notna().any()
+
+        # MA5
+        if has_valid_data(plot_df['MA5']):
+            apd.append(mpf.make_addplot(plot_df['MA5'], color='blue', width=0.8, panel=0))
+            
+        # MA100 (Sering error di sini jika data < 100 candle)
+        if has_valid_data(plot_df['MA100']):
+            apd.append(mpf.make_addplot(plot_df['MA100'], color='black', width=1.2, panel=0))
+            
+        # Bollinger Bands
+        if has_valid_data(plot_df['BB_Upper']) and has_valid_data(plot_df['BB_Lower']):
+            apd.append(mpf.make_addplot(plot_df['BB_Upper'], color='gray', linestyle='--', width=0.5, panel=0))
+            apd.append(mpf.make_addplot(plot_df['BB_Lower'], color='gray', linestyle='--', width=0.5, panel=0))
+            
+        # RSI
+        if has_valid_data(plot_df['RSI']):
+            apd.append(mpf.make_addplot(plot_df['RSI'], panel=rsi_panel, color='purple', ylabel='RSI', width=1.5))
+            apd.append(mpf.make_addplot([70]*len(plot_df), panel=rsi_panel, color='red', linestyle='--', width=0.5))
+            apd.append(mpf.make_addplot([30]*len(plot_df), panel=rsi_panel, color='green', linestyle='--', width=0.5))
         
         mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', edge='inherit', wick='inherit', volume='in')
         s  = mpf.make_mpf_style(marketcolors=mc, gridstyle='--', y_on_right=True)
