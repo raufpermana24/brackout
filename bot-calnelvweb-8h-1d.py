@@ -6,16 +6,18 @@ import requests
 import os
 import time
 import json
-import websockets # Pastikan install: pip install websockets
+import websockets
 from datetime import datetime
 
 # --- KONFIGURASI ENV ---
 API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97')
 API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
 
+
 # Telegram Config (Isi manual jika tidak pakai env var)
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA') 
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003726025593')
+
 
 # --- SETTING ---
 # Filter Persentase Minimum (Hanya kirim jika >= 2.5 atau <= -2.5)
@@ -26,8 +28,10 @@ TOP_COUNT = 100
 
 # Jeda antar pengiriman gambar (5 detik)
 DELAY_SEND = 5
-# Timeframe untuk Chart
-CHART_TIMEFRAME = '1d' 
+
+# [BARU] List Timeframe yang akan di-scan dan dikirim gambarnya
+CHART_TIMEFRAMES = ['1d', '8h'] 
+
 # URL WebSocket Binance Futures (All Market Ticker)
 WS_URL = "wss://fstream.binance.com/ws/!ticker@arr"
 
@@ -40,11 +44,12 @@ async def get_exchange():
     })
 
 # --- FUNGSI CHART & INDIKATOR ---
-def generate_chart_image(symbol, change_pct, df, rank_num, rank_type):
+def generate_chart_image(symbol, change_pct, df, rank_num, rank_type, tf_label):
     if df is None or len(df) < 1: return None
 
     clean_symbol = symbol.replace('/', '')
-    file_path = f"rank_{rank_num}_{clean_symbol}.png"
+    # Nama file unik per timeframe
+    file_path = f"rank_{rank_num}_{clean_symbol}_{tf_label}.png"
     
     try:
         # Indikator
@@ -76,7 +81,6 @@ def generate_chart_image(symbol, change_pct, df, rank_num, rank_type):
         if vol_min == vol_max: 
             show_volume = False
         
-        # Helper check
         def has_valid_data(series):
             return series.notna().any()
 
@@ -121,7 +125,8 @@ def generate_chart_image(symbol, change_pct, df, rank_num, rank_type):
         mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', edge='inherit', wick='inherit', volume='in')
         s  = mpf.make_mpf_style(marketcolors=mc, gridstyle='--', y_on_right=True)
         
-        title = f"\n#{rank_num} {rank_type}: {symbol}\nChange 24H: {change_pct:+.2f}%"
+        # Judul Chart (Menampilkan Timeframe)
+        title = f"\n#{rank_num} {rank_type} [{tf_label.upper()}]\n{symbol} (24H Chg: {change_pct:+.2f}%)"
         
         plot_args = {
             'type': 'candle', 
@@ -185,103 +190,89 @@ async def process_and_send_list(exchange, sorted_list, rank_type_label):
         print(f"⚠️ Tidak ada koin yang memenuhi syarat > {MIN_CHANGE_THRESHOLD}% untuk {rank_type_label}")
         return
 
-    print(f"🚀 Memulai pengiriman {total} chart untuk kategori: {rank_type_label}")
+    print(f"🚀 Memulai pengiriman {total} koin (Multi-TF) untuk kategori: {rank_type_label}")
     
     for i, item in enumerate(sorted_list, 1):
         symbol = item['symbol']
         pct = item['pct']
         price = item['price']
         
-        print(f"[{i}/{total}] Mengambil data history {symbol}...")
+        print(f"[{i}/{total}] Memproses {symbol}...")
         
-        try:
-            # Menggunakan REST API untuk history candle (wajib untuk chart)
-            ohlcv = await fetch_ohlcv_safe(exchange, symbol, CHART_TIMEFRAME)
-            
-            if ohlcv:
-                df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                df.set_index('timestamp', inplace=True)
+        # --- LOOP MULTI TIMEFRAME (1D & 8H) ---
+        for tf in CHART_TIMEFRAMES:
+            try:
+                print(f"   -> Mengambil data history {tf}...")
+                ohlcv = await fetch_ohlcv_safe(exchange, symbol, tf)
                 
-                chart_path = generate_chart_image(symbol, pct, df, i, rank_type_label)
-                
-                if chart_path:
-                    icon = "🔥" if rank_type_label == "TOP GAINER" else "🩸"
-                    rsi_val = df['RSI'].iloc[-1] if 'RSI' in df else 0
+                if ohlcv:
+                    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df.set_index('timestamp', inplace=True)
                     
-                    caption = (
-                        f"{icon} **#{i} {rank_type_label}**\n"
-                        f"Coin: `{symbol}`\n"
-                        f"Change 24H: **{pct:+.2f}%**\n"
-                        f"Price: `{price}`\n"
-                        f"RSI: {rsi_val:.1f}"
-                    )
+                    chart_path = generate_chart_image(symbol, pct, df, i, rank_type_label, tf)
                     
-                    print(f"📤 Mengirim chart {symbol} ({pct:.2f}%) ke Telegram...")
-                    await send_telegram_photo(chart_path, caption)
-                    
-                    if os.path.exists(chart_path): os.remove(chart_path)
-                    
-                    print(f"⏳ Jeda {DELAY_SEND} detik...")
-                    await asyncio.sleep(DELAY_SEND)
-            else:
-                print(f"⚠️ Data history kosong untuk {symbol} (Skip)")
+                    if chart_path:
+                        icon = "🔥" if rank_type_label == "TOP GAINER" else "🩸"
+                        rsi_val = df['RSI'].iloc[-1] if 'RSI' in df else 0
+                        
+                        caption = (
+                            f"{icon} **#{i} {rank_type_label}**\n"
+                            f"Coin: `{symbol}`\n"
+                            f"TF: **{tf.upper()}**\n"
+                            f"Change 24H: **{pct:+.2f}%**\n"
+                            f"Price: `{price}`\n"
+                            f"RSI: {rsi_val:.1f}"
+                        )
+                        
+                        print(f"   📤 Mengirim chart {tf} ke Telegram...")
+                        await send_telegram_photo(chart_path, caption)
+                        
+                        if os.path.exists(chart_path): os.remove(chart_path)
+                        
+                        # Jeda pendek antar timeframe di koin yang sama
+                        await asyncio.sleep(1)
+                else:
+                    print(f"   ⚠️ Data history kosong untuk {tf} (Skip)")
 
-        except Exception as e:
-            print(f"Error processing {symbol}: {e}")
-            await asyncio.sleep(1) 
+            except Exception as e:
+                print(f"   Error processing {symbol} {tf}: {e}")
+                await asyncio.sleep(1)
+
+        # Jeda antar Koin (Sesuai setting)
+        print(f"⏳ Jeda {DELAY_SEND} detik sebelum koin berikutnya...")
+        await asyncio.sleep(DELAY_SEND)
 
 # --- METODE 2: SNAPSHOT PAKE WEBSOCKET (UTAMA) ---
 async def get_snapshot_websocket():
-    """
-    Mengambil data snapshot pasar menggunakan WebSocket.
-    Lebih cepat dan tidak memakan kuota REST API.
-    """
     print("🔌 Mencoba mengambil snapshot via WebSocket...")
     try:
-        # Connect dan tunggu 1 pesan saja (snapshot)
         async with websockets.connect(WS_URL) as websocket:
-            # Timeout 10 detik, jika macet langsung pindah ke REST
             msg = await asyncio.wait_for(websocket.recv(), timeout=10)
             data = json.loads(msg)
             
             market_data = []
             for ticker in data:
-                symbol_raw = ticker['s'] # Format: BTCUSDT
-                
-                # Filter hanya USDT Futures
+                symbol_raw = ticker['s'] 
                 if not symbol_raw.endswith('USDT'): continue
                 
-                # Format ulang simbol ke ccxt format: BTC/USDT
                 symbol_ccxt = f"{symbol_raw[:-4]}/{symbol_raw[-4:]}"
+                pct = float(ticker['P'])
+                price = float(ticker['c'])
                 
-                # Ambil data percentage dan last price
-                pct = float(ticker['P']) # P = Price change percent
-                price = float(ticker['c']) # c = Last price
-                
-                # LOGIKA FILTER
                 if abs(pct) < MIN_CHANGE_THRESHOLD:
                     continue
                 
-                market_data.append({
-                    'symbol': symbol_ccxt,
-                    'pct': pct,
-                    'price': price
-                })
+                market_data.append({'symbol': symbol_ccxt, 'pct': pct, 'price': price})
             
             print(f"✅ WebSocket Snapshot Berhasil! {len(market_data)} koin lolos filter.")
             return market_data
-
     except Exception as e:
         print(f"⚠️ WebSocket Gagal/Timeout: {e}")
         return None
 
 # --- METODE 3: SNAPSHOT PAKE REST API (CADANGAN) ---
 async def get_snapshot_rest(exchange):
-    """
-    Mengambil data snapshot pasar menggunakan REST API (Fetch Tickers).
-    Digunakan jika WebSocket gagal.
-    """
     print("⚠️ Beralih ke metode REST API (Fetch Tickers)...")
     try:
         tickers = await exchange.fetch_tickers()
@@ -293,11 +284,7 @@ async def get_snapshot_rest(exchange):
                 if abs(pct) < MIN_CHANGE_THRESHOLD:
                     continue 
                 
-                market_data.append({
-                    'symbol': symbol,
-                    'pct': pct,
-                    'price': ticker['last']
-                })
+                market_data.append({'symbol': symbol, 'pct': pct, 'price': ticker['last']})
         print(f"✅ REST API Snapshot Berhasil! {len(market_data)} koin lolos filter.")
         return market_data
     except Exception as e:
@@ -306,7 +293,7 @@ async def get_snapshot_rest(exchange):
 
 async def run_chart_ranker():
     exchange = await get_exchange()
-    print(f"🤖 Bot Hybrid (WS + REST) Berjalan...")
+    print(f"🤖 Bot Hybrid Multi-TF (8H & 1D) Berjalan...")
     print(f"🛡️ Syarat Lolos: Persentase >= {MIN_CHANGE_THRESHOLD}% atau <= -{MIN_CHANGE_THRESHOLD}%")
     print(f"🎯 Target Maksimal: Top {TOP_COUNT} Gainers & {TOP_COUNT} Losers")
     
@@ -314,40 +301,33 @@ async def run_chart_ranker():
         while True:
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 📥 Memulai Siklus Scan...")
             
-            # 1. COBA AMBIL DATA PAKE WEBSOCKET
+            # 1. AMBIL SNAPSHOT (24H Change)
             market_data = await get_snapshot_websocket()
-            
-            # 2. JIKA WEBSOCKET ERROR/KOSONG, AMBIL PAKE REST API
             if market_data is None:
                 market_data = await get_snapshot_rest(exchange)
             
             if not market_data:
-                print("❌ Gagal mengambil data pasar dari kedua metode. Tidur 1 menit lalu coba lagi.")
+                print("❌ Gagal mengambil data pasar. Tidur 1 menit.")
                 await asyncio.sleep(60)
                 continue
 
             print(f"📊 Total Koin Lolos Filter (+/- {MIN_CHANGE_THRESHOLD}%): {len(market_data)} koin.")
             
-            # Pisahkan Gainer dan Loser
             gainers_only = [x for x in market_data if x['pct'] > 0]
             losers_only = [x for x in market_data if x['pct'] < 0]
 
-            # 3. SORTING DI MEMORY
-            sorted_gainers = sorted(gainers_only, key=lambda x: x['pct'], reverse=True)
-            final_gainers = sorted_gainers[:TOP_COUNT]
+            # 2. SORTING
+            sorted_gainers = sorted(gainers_only, key=lambda x: x['pct'], reverse=True)[:TOP_COUNT]
+            sorted_losers = sorted(losers_only, key=lambda x: x['pct'])[:TOP_COUNT]
             
-            sorted_losers = sorted(losers_only, key=lambda x: x['pct'])
-            final_losers = sorted_losers[:TOP_COUNT]
-            
-            # 4. PROSES PENGIRIMAN
-            # Catatan: Di dalam fungsi ini, kita menggunakan REST API (fetch_ohlcv_safe)
-            # karena WebSocket Ticker tidak menyediakan history candle untuk chart.
-            await process_and_send_list(exchange, final_gainers, "TOP GAINER")
+            # 3. PROSES PENGIRIMAN (Gainers)
+            await process_and_send_list(exchange, sorted_gainers, "TOP GAINER")
             
             print("\n✅ Gainers Selesai. Istirahat 10 detik...\n")
             await asyncio.sleep(10)
             
-            await process_and_send_list(exchange, final_losers, "TOP LOSER")
+            # 4. PROSES PENGIRIMAN (Losers)
+            await process_and_send_list(exchange, sorted_losers, "TOP LOSER")
             
             print("\n🏁 Siklus Selesai. Bot tidur 1 Jam.")
             await asyncio.sleep(3600)
@@ -362,3 +342,6 @@ if __name__ == "__main__":
         asyncio.run(run_chart_ranker())
     except KeyboardInterrupt:
         print("Bot Stopped.")
+
+
+
