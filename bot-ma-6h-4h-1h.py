@@ -1,13 +1,16 @@
 import asyncio
-import ccxt.async_support as ccxt  # Mode Async (Cepat)
-import ccxt as ccxt_sync           # Mode Sync (Robust/Fallback)
+import json
+import websockets
+import aiohttp
+import ccxt.async_support as ccxt # Untuk fallback data
 import pandas as pd
 import mplfinance as mpf
 import requests
 import os
 import time
+import sys
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ================= KONFIGURASI =================
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97')
@@ -15,36 +18,31 @@ BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNow
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8562793193:AAHDulfzVhhnuPfNfy4Zk6ONBNSNbGwVJ8c')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003819540522')
 
+# Setting Scanner
+TOP_COINS = 40          # Pantau 40 Koin Teratas (Agar koneksi stabil)
+TIMEFRAMES = ['5m', '15m', '1h', '4h', '6h'] # Multi Timeframe Lengkap
+LIMIT_HISTORY = 100     # Buffer history di RAM
+SEND_DELAY = 5          # Jeda 5 detik sebelum kirim
 
-# Konfigurasi Scanner
-TOP_COINS = 400
-BATCH_SIZE = 20
-DELAY_BATCH = 0.5
-TELEGRAM_SEND_DELAY = 5  # Jeda 5 detik sebelum kirim signal
+# Endpoint Binance Futures
+WS_URL = "wss://fstream.binance.com/stream?streams="
 
-# ================= MEMORY SYSTEM (ANTI-SPAM) =================
+# ================= MEMORY STORE =================
+# DATA_STORE menyimpan data dari WebSocket
+DATA_STORE = {}
 SENT_SIGNALS = set()
 
-def is_signal_already_sent(symbol, timeframe, candle_timestamp, signal_type):
-    signal_id = f"{symbol}_{timeframe}_{candle_timestamp}_{signal_type}"
-    return signal_id in SENT_SIGNALS
+# ================= UTILS & TELEGRAM =================
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
-def mark_signal_as_sent(symbol, timeframe, candle_timestamp, signal_type):
-    signal_id = f"{symbol}_{timeframe}_{candle_timestamp}_{signal_type}"
-    SENT_SIGNALS.add(signal_id)
-
-def clean_old_memory():
-    if len(SENT_SIGNALS) > 5000:
-        SENT_SIGNALS.clear()
-
-# ================= TELEGRAM UTILS =================
 def send_telegram_sync(message):
     if not TELEGRAM_TOKEN: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=10)
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}, timeout=5)
     except Exception as e:
-        print(f"[TG ERROR] {e}")
+        log(f"[TG ERROR] {e}")
 
 def send_photo_sync(caption, filepath):
     if not TELEGRAM_TOKEN: return
@@ -53,289 +51,323 @@ def send_photo_sync(caption, filepath):
         with open(filepath, 'rb') as img:
             requests.post(url, files={'photo': img}, data={'chat_id': TELEGRAM_CHAT_ID, 'caption': caption}, timeout=20)
     except Exception as e:
-        print(f"[TG PHOTO ERROR] {e}")
+        log(f"[TG FOTO ERROR] {e}")
 
-# ================= CHART GENERATOR (ROBUST) =================
-def generate_chart(df, symbol, timeframe, extra_info=""):
-    filename = f"chart_{symbol.replace('/', '')}_{timeframe}_{int(time.time())}.png"
+# ================= INDIKATOR =================
+def calculate_indicators(df):
     try:
-        if len(df) < 30: return None
+        # MA
+        df['MA5'] = df['close'].rolling(window=5).mean()
+        df['MA10'] = df['close'].rolling(window=10).mean()
+        df['MA30'] = df['close'].rolling(window=30).mean()
+        
+        # RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        df['RSI'] = 100 - (100 / (1 + rs))
 
+        # MACD
+        exp12 = df['close'].ewm(span=12, adjust=False).mean()
+        exp26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['MACD'] = exp12 - exp26
+        df['MACD_SIGNAL'] = df['MACD'].ewm(span=9, adjust=False).mean()
+        
+        # Vol MA
+        df['VolMA'] = df['volume'].rolling(window=20).mean()
+        
+        # ATR (untuk NATR)
+        df['prev_close'] = df['close'].shift(1)
+        df['tr'] = df[['high', 'prev_close']].max(axis=1) - df[['low', 'prev_close']].min(axis=1)
+        df['atr'] = df['tr'].rolling(window=14).mean()
+        
+        return df
+    except Exception:
+        return df
+
+def generate_chart(df, symbol, timeframe, extra_info=""):
+    """Fungsi Pembuat Chart (Bisa Gagal jika data WS bolong)"""
+    filename = f"chart_{symbol}_{timeframe}_{int(time.time())}.png"
+    try:
+        if len(df) < 30: return None # Data terlalu sedikit
+        
         plot_df = df.tail(60).copy()
         plot_df.set_index('timestamp', inplace=True)
-
+        
         mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', edge='i', wick='i', volume='in', inherit=True)
         s = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', y_on_right=True)
-
+        
         ap = [
             mpf.make_addplot(plot_df['MA5'], color='cyan', width=1, panel=0),
             mpf.make_addplot(plot_df['MA10'], color='orange', width=1, panel=0),
             mpf.make_addplot(plot_df['MA30'], color='purple', width=2, panel=0),
             mpf.make_addplot(plot_df['RSI'], panel=2, color='#b48eff', ylabel='RSI', width=1.5),
         ]
-
+        
         mpf.plot(
             plot_df, type='candle', style=s, addplot=ap, volume=True,
-            title=f"{symbol} ({timeframe}) {extra_info}",
+            title=f"FUTURES: {symbol} ({timeframe}) {extra_info}",
             panel_ratios=(6,2,2), tight_layout=True,
             hlines=dict(hlines=[70,30], colors=['red','green'], linestyle='-.', linewidths=0.5, alpha=0.5, panel=2),
             savefig=dict(fname=filename, dpi=80, bbox_inches='tight')
         )
         return filename
-    except Exception as e:
-        return None
-
-# ================= INDICATORS & FETCH LOGIC =================
-
-def calculate_indicators(df):
-    df['MA5'] = df['close'].rolling(window=5).mean()
-    df['MA10'] = df['close'].rolling(window=10).mean()
-    df['MA30'] = df['close'].rolling(window=30).mean()
-    
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    exp12 = df['close'].ewm(span=12, adjust=False).mean()
-    exp26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp12 - exp26
-    df['MACD_SIGNAL'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    
-    df['VolMA'] = df['volume'].rolling(window=20).mean()
-    return df
-
-async def calculate_natr(exchange, symbol, timeframe, period):
-    try:
-        limit_data = period + 20
-        bars = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit_data)
-        if not bars: return 0.0
-        df = pd.DataFrame(bars, columns=['t', 'o', 'high', 'low', 'close', 'v'])
-        df['prev_close'] = df['close'].shift(1)
-        df['tr'] = df[['high', 'prev_close']].max(axis=1) - df[['low', 'prev_close']].min(axis=1)
-        df['atr'] = df['tr'].rolling(window=period).mean()
-        last_close = df['close'].iloc[-1]
-        return (df['atr'].iloc[-1] / last_close) * 100 if last_close else 0.0
-    except:
-        return 0.0
-
-async def fetch_data_fast(exchange, symbol, timeframe):
-    """Metode 1: Async Cepat"""
-    try:
-        bars = await exchange.fetch_ohlcv(symbol, timeframe, limit=100)
-        if not bars or len(bars) < 35: return None
-        df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
     except Exception:
         return None
 
-def fetch_data_robust_fallback(symbol, timeframe):
-    """Metode 2: Sync Robust Fallback"""
-    print(f"⚠️ [FALLBACK] Mengambil data REST API untuk {symbol}...")
+# ================= REST API FALLBACK =================
+
+async def fetch_data_fallback(symbol, timeframe):
+    """
+    Mengambil data bersih via REST API jika WebSocket data bermasalah.
+    """
+    log(f"⚠️ [FALLBACK] Mengambil data REST API untuk {symbol} ({timeframe})...")
+    exchange = ccxt.binance({'options': {'defaultType': 'future'}})
     try:
-        fallback_exchange = ccxt_sync.binance({'options': {'defaultType': 'future'}})
-        bars = fallback_exchange.fetch_ohlcv(symbol, timeframe, limit=500)
+        bars = await exchange.fetch_ohlcv(symbol, timeframe, limit=120)
+        await exchange.close()
+        
         if not bars: return None
         
         df = pd.DataFrame(bars, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        # Hitung ulang indikator dengan data bersih
+        df = calculate_indicators(df)
         return df
     except Exception as e:
-        print(f"❌ [FALLBACK GAGAL] {e}")
+        log(f"❌ [FALLBACK GAGAL] {e}")
+        await exchange.close()
         return None
 
-# ================= CORE LOGIC =================
+# ================= WEBSOCKET LOGIC =================
 
-async def get_top_volume_symbols(exchange):
-    print(f"🔍 Mengambil Top {TOP_COINS} Koin (Volume Tertinggi)...")
-    try:
-        markets = await exchange.load_markets()
-        tickers = await exchange.fetch_tickers()
-        futures = []
-        for symbol, data in tickers.items():
-            if symbol in markets and markets[symbol].get('quote') == 'USDT' and markets[symbol].get('active'):
-                vol = data.get('quoteVolume') or 0
-                futures.append({'symbol': symbol, 'volume': vol})
-        futures.sort(key=lambda x: x['volume'], reverse=True)
-        return [x['symbol'] for x in futures[:TOP_COINS]]
-    except Exception as e:
-        print(f"Error Symbols: {e}")
-        return []
+async def get_top_futures_symbols():
+    log("🔍 Fetching Top Volume Futures...")
+    async with aiohttp.ClientSession() as session:
+        async with session.get('https://fapi.binance.com/fapi/v1/ticker/24hr') as resp:
+            data = await resp.json()
+            
+    futures = []
+    for item in data:
+        if item['symbol'].endswith('USDT'):
+            futures.append({'symbol': item['symbol'], 'volume': float(item['quoteVolume'])})
+            
+    futures.sort(key=lambda x: x['volume'], reverse=True)
+    top_list = [x['symbol'] for x in futures[:TOP_COINS]]
+    return top_list
 
-async def analyze_and_alert(exchange, symbol, timeframe):
-    # 1. Fetch Fast
-    df = await fetch_data_fast(exchange, symbol, timeframe)
-    if df is None: return None 
+async def initialize_data(symbols):
+    """Pre-load data via REST agar indikator siap hitung"""
+    log("⏳ Pre-loading history data...")
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        async def fetch(sym, tf):
+            try:
+                url = f"https://fapi.binance.com/fapi/v1/klines?symbol={sym}&interval={tf}&limit={LIMIT_HISTORY}"
+                async with session.get(url) as resp:
+                    data = await resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        df = pd.DataFrame(data, columns=['t', 'o', 'h', 'l', 'c', 'v', 'T', 'q', 'n', 'V', 'Q', 'B'])
+                        df = df[['t', 'o', 'h', 'l', 'c', 'v']].astype(float)
+                        df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
+                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                        if sym not in DATA_STORE: DATA_STORE[sym] = {}
+                        DATA_STORE[sym][tf] = df
+            except: pass
 
-    df = calculate_indicators(df)
+        all_combinations = [(sym, tf) for sym in symbols for tf in TIMEFRAMES]
+        # Batching request rest api
+        for i in range(0, len(all_combinations), 30):
+            chunk = all_combinations[i:i + 30]
+            await asyncio.gather(*[fetch(s, t) for s, t in chunk])
+            await asyncio.sleep(0.2)
+    log("✅ History Loaded.")
+
+async def handle_signal_alert(symbol, timeframe, signal_type, signal_side, df, vol_desc):
+    """
+    Fungsi pengirim Alert dengan mekanisme FALLBACK CHART
+    """
+    loop = asyncio.get_running_loop()
     
-    last_closed = df.iloc[-2]
-    prev_closed = df.iloc[-3]
-    candle_ts = last_closed['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+    # 1. Jeda 5 Detik (Sesuai Request)
+    log(f"🔔 ALERT DETECTED: {symbol} {signal_type}. Waiting {SEND_DELAY}s...")
+    await asyncio.sleep(SEND_DELAY)
+    
+    last = df.iloc[-1]
+    
+    # 2. Coba Generate Chart dengan Data WebSocket (Cepat)
+    chart_file = await loop.run_in_executor(None, generate_chart, df, symbol, timeframe, f"| {vol_desc}")
+    
+    # 3. FALLBACK: Jika chart gagal, ambil data ulang via REST API
+    if chart_file is None:
+        log(f"⚠️ Chart WebSocket gagal untuk {symbol}. Mencoba REST API...")
+        df_fallback = await fetch_data_fallback(symbol, timeframe)
+        
+        if df_fallback is not None:
+            # Generate chart ulang dengan data bersih
+            chart_file = await loop.run_in_executor(None, generate_chart, df_fallback, symbol, timeframe, f"| {vol_desc} (REST)")
+    
+    # Siapkan Pesan Telegram
+    price = last['close']
+    rsi = last['RSI']
+    rsi_stat = "OVERBOUGHT" if rsi > 70 else "OVERSOLD" if rsi < 30 else "Neutral"
+    macd_stat = "Bullish" if last['MACD'] > last['MACD_SIGNAL'] else "Bearish"
+    
+    # Hitung NATR 5m (Estimasi)
+    natr = (last['atr'] / price * 100) if price else 0
 
-    # --- FILTER VOLUME (MARKET TIDAK NORMAL) ---
-    curr_vol = last_closed['volume']
-    avg_vol = last_closed['VolMA']
-    if avg_vol == 0: return None
-    vol_ratio = curr_vol / avg_vol
+    header = "🚀" if "LONG" in signal_side else "🔻"
+    if signal_type == 'EXTREME_VOL': header = "⚡"
+
+    caption = (
+        f"{header} **FUTURES SIGNAL {signal_side}**\n\n"
+        f"🪙 `#{symbol}`\n"
+        f"⏱ TF: `{timeframe}` | 💵 ${price}\n\n"
+        f"📊 **Volume:** {vol_desc}\n"
+        f"📈 **RSI:** {rsi:.1f} ({rsi_stat})\n"
+        f"📉 **MACD:** {macd_stat}\n\n"
+        f"🌪 **NATR:** `{natr:.2f}%`\n"
+        f"📋 Trigger: {signal_type.replace('_', ' ')}"
+    )
+
+    # Kirim ke Telegram
+    if chart_file:
+        await loop.run_in_executor(None, send_photo_sync, caption, chart_file)
+        if os.path.exists(chart_file): os.remove(chart_file)
+    else:
+        # Jika fallback pun gagal gambar, kirim teks saja
+        await loop.run_in_executor(None, send_telegram_sync, caption)
+
+async def analyze_logic(symbol, timeframe, df):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    candle_ts = last['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+
+    # Filter Volume (Abnormal Only)
+    avg_vol = last['VolMA']
+    if avg_vol == 0: return
+    vol_ratio = last['volume'] / avg_vol
     
     is_high_vol = vol_ratio > 1.5
     is_low_vol = vol_ratio < 0.5
     
-    if not (is_high_vol or is_low_vol): return None # Skip Normal Market
+    if not (is_high_vol or is_low_vol): return # Skip Normal Market
 
     vol_desc = f"🔥 HIGH ({vol_ratio:.1f}x)" if is_high_vol else f"❄️ LOW ({vol_ratio:.1f}x)"
     signal_type, signal_side = None, None
     has_alert = False
 
-    # --- LOGIKA SIGNAL ---
-    if prev_closed['MA5'] <= prev_closed['MA10'] and last_closed['MA5'] > last_closed['MA10']:
-        if not is_signal_already_sent(symbol, timeframe, candle_ts, 'GOLDEN_CROSS'):
-            signal_type = 'GOLDEN_CROSS'
-            signal_side = 'LONG 🟢'
-            has_alert = True
-    elif timeframe != '5m':
-        if last_closed['low'] <= last_closed['MA30'] <= last_closed['high']:
-            if not is_signal_already_sent(symbol, timeframe, candle_ts, 'MA30_TOUCH'):
-                signal_type = 'MA30_TOUCH'
-                signal_side = 'LONG 🟢 (Bounce)' if last_closed['close'] > last_closed['MA30'] else 'SHORT 🔴 (Reject)'
-                has_alert = True
-    elif vol_ratio > 2.5:
-        if not is_signal_already_sent(symbol, timeframe, candle_ts, 'VOL_SPIKE'):
-            signal_type = 'VOLUME_SPIKE'
-            signal_side = 'INFO ⚠️'
-            has_alert = True
+    # Logic
+    if prev['MA5'] <= prev['MA10'] and last['MA5'] > last['MA10']:
+        signal_type = 'GOLDEN_CROSS'
+        signal_side = 'LONG 🟢'
+        has_alert = True
+    elif timeframe != '5m' and (last['low'] <= last['MA30'] <= last['high']):
+        signal_type = 'MA30_TOUCH'
+        signal_side = 'LONG 🟢 (Bounce)' if last['close'] > last['MA30'] else 'SHORT 🔴 (Reject)'
+        has_alert = True
+    elif vol_ratio > 3.0:
+        signal_type = 'EXTREME_VOL'
+        signal_side = 'INFO ⚠️'
+        has_alert = True
 
     if has_alert:
-        # Kunci Sinyal
-        mark_signal_as_sent(symbol, timeframe, candle_ts, signal_type)
+        sig_id = f"{symbol}_{timeframe}_{candle_ts}_{signal_type}"
+        if sig_id in SENT_SIGNALS: return
+        SENT_SIGNALS.add(sig_id)
+        if len(SENT_SIGNALS) > 5000: SENT_SIGNALS.clear()
         
-        # JEDA 5 DETIK SEBELUM PROSES LANJUTAN (Sesuai Permintaan)
-        # Kita taruh di sini agar tidak memblokir scanning jika tidak ada sinyal
-        print(f"   ⏳ Menunggu {TELEGRAM_SEND_DELAY} detik sebelum kirim telegram...")
-        await asyncio.sleep(TELEGRAM_SEND_DELAY)
+        # Panggil Handler Sinyal (Yang punya fitur Delay & Fallback)
+        await handle_signal_alert(symbol, timeframe, signal_type, signal_side, df, vol_desc)
 
-        # Hitung NATR
-        natr_task1 = calculate_natr(exchange, symbol, '1m', 30)
-        natr_task2 = calculate_natr(exchange, symbol, '5m', 14)
-        n1, n5 = await asyncio.gather(natr_task1, natr_task2)
-        
-        # Buat Chart (Coba Fast)
-        chart_file = generate_chart(df, symbol, timeframe, f"| {vol_desc}")
-        
-        # Fallback Chart (Jika Fast gagal)
-        if chart_file is None:
-            df_robust = fetch_data_robust_fallback(symbol, timeframe)
-            if df_robust is not None:
-                df_robust = calculate_indicators(df_robust)
-                chart_file = generate_chart(df_robust, symbol, timeframe, f"| {vol_desc} (R)")
-        
-        rsi_val = last_closed['RSI']
-        rsi_stat = "OVERBOUGHT 🔴" if rsi_val > 70 else "OVERSOLD 🟢" if rsi_val < 30 else "Neutral"
-        macd_stat = "Bullish 🟢" if last_closed['MACD'] > last_closed['MACD_SIGNAL'] else "Bearish 🔴"
-        
-        header = "🚀" if "LONG" in signal_side else "🔻"
-        if signal_type == 'VOLUME_SPIKE': header = "⚡"
-        
-        caption = (
-            f"{header} **SIGNAL {signal_side}**\n\n"
-            f"🪙 `#{symbol.replace('/','')}`\n"
-            f"⏱ TF: `{timeframe}` | 💵 ${last_closed['close']}\n\n"
-            f"📊 **Volume:** {vol_desc}\n"
-            f"📈 **RSI:** {rsi_val:.1f} ({rsi_stat})\n"
-            f"📉 **MACD:** {macd_stat}\n\n"
-            f"🌪 **NATR:** 1m: `{n1:.2f}%` | 5m: `{n5:.2f}%`\n"
-            f"📋 Trigger: {signal_type.replace('_', ' ')}"
-        )
-        
-        print(f"   🔔 SENT: {symbol} {signal_type} ({timeframe})")
-        
-        if chart_file:
-            send_photo_sync(caption, chart_file)
-            if os.path.exists(chart_file): os.remove(chart_file)
-        else:
-            send_telegram_sync(caption)
-
-async def run_scanner_job(active_timeframes):
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🔄 Memulai Scan: {active_timeframes}")
-    
-    exchange = ccxt.binance({
-        'apiKey': BINANCE_API_KEY, 'secret': BINANCE_SECRET_KEY,
-        'enableRateLimit': False, 'options': {'defaultType': 'future'}
-    })
-
+async def process_stream_data(symbol, timeframe, kline):
     try:
-        symbols = await get_top_volume_symbols(exchange)
-        if not symbols: return
+        is_closed = kline['x']
+        if symbol not in DATA_STORE or timeframe not in DATA_STORE[symbol]: return
 
-        for tf in active_timeframes:
-            print(f"📊 Scanning {tf} ({len(symbols)} coins)...")
-            
-            for i in range(0, len(symbols), BATCH_SIZE):
-                batch = symbols[i : i + BATCH_SIZE]
-                tasks = [analyze_and_alert(exchange, sym, tf) for sym in batch]
-                await asyncio.gather(*tasks)
-                await asyncio.sleep(DELAY_BATCH)
-            
-    finally:
-        await exchange.close()
-        clean_old_memory()
-    print(f"✅ Selesai Scan {active_timeframes}")
+        df = DATA_STORE[symbol][timeframe]
+        ts = pd.to_datetime(kline['t'], unit='ms')
+        
+        new_row = {
+            'timestamp': ts, 'open': float(kline['o']), 'high': float(kline['h']),
+            'low': float(kline['l']), 'close': float(kline['c']), 'volume': float(kline['v'])
+        }
 
-async def main_scheduler():
-    print("=== BOT FINAL HYBRID (5s Delay + TF 1h,4h,6h) ===")
-    
+        if df.iloc[-1]['timestamp'] == ts:
+            df.iloc[-1] = list(new_row.values())
+        else:
+            new_df = pd.DataFrame([new_row])
+            df = pd.concat([df, new_df], ignore_index=True)
+            if len(df) > LIMIT_HISTORY + 20: df = df.iloc[20:].reset_index(drop=True)
+        
+        DATA_STORE[symbol][timeframe] = df
+
+        if is_closed:
+            df = calculate_indicators(df)
+            await analyze_logic(symbol, timeframe, df)
+
+    except Exception:
+        pass
+
+async def listen_socket(streams):
+    url = WS_URL + "/".join(streams)
     while True:
-        now = datetime.now()
-        # Hitung waktu ke 5 menit berikutnya
-        minutes_to_next = 5 - (now.minute % 5)
-        next_run = now + timedelta(minutes=minutes_to_next)
-        next_run = next_run.replace(second=0, microsecond=0)
-        scheduled_time = next_run + timedelta(seconds=15)
-        
-        seconds_to_wait = (scheduled_time - datetime.now()).total_seconds()
-        if seconds_to_wait < 0: seconds_to_wait += 300
+        try:
+            log(f"🔌 Connecting Batch ({len(streams)})...")
+            async with websockets.connect(url) as ws:
+                log("✅ WS Connected.")
+                while True:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    if 'data' in data:
+                        p = data['data']
+                        await process_stream_data(p['s'], p['k']['i'], p['k'])
+        except Exception:
+            await asyncio.sleep(5)
+
+async def main():
+    log("=== BOT HYBRID FINAL (WS + REST FALLBACK + MULTI TF) ===")
+    
+    symbols = await get_top_futures_symbols()
+    if not symbols: return
+
+    await initialize_data(symbols)
+    
+    all_streams = []
+    for sym in symbols:
+        for tf in TIMEFRAMES:
+            all_streams.append(f"{sym.lower()}@kline_{tf}")
             
-        print(f"\n⏳ Menunggu {int(seconds_to_wait)} detik...")
-        await asyncio.sleep(seconds_to_wait)
+    BATCH_SIZE = 40
+    tasks = []
+    for i in range(0, len(all_streams), BATCH_SIZE):
+        tasks.append(listen_socket(all_streams[i:i+BATCH_SIZE]))
         
-        # --- PENENTUAN TIMEFRAME ---
-        run_minute = next_run.minute
-        run_hour = next_run.hour
-        
-        active_tfs = ['5m'] # 5m selalu discan
-        
-        if run_minute % 15 == 0: active_tfs.append('15m')
-        if run_minute % 30 == 0: active_tfs.append('30m')
-        
-        # Setiap jam (Menit 00)
-        if run_minute == 0:
-            active_tfs.append('1h')
-            
-            # Setiap 4 Jam (00, 04, 08, 12, 16, 20)
-            if run_hour % 4 == 0:
-                active_tfs.append('4h')
-                
-            # Setiap 6 Jam (00, 06, 12, 18)
-            if run_hour % 6 == 0:
-                active_tfs.append('6h')
-            
-        await run_scanner_job(active_tfs)
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main_scheduler())
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\nBot Stopped")
 
 
-Detail Perubahan Penting:
-Jeda 5 Detik (TELEGRAM_SEND_DELAY):
-Di dalam fungsi analyze_and_alert, setelah sinyal terdeteksi valid (if has_alert:), saya menambahkan baris:
-print(f"   ⏳ Menunggu {TELEGRAM_SEND_DELAY} detik sebelum kirim telegram...")
-await asyncio.sleep(TELEGRAM_SEND_DELAY)
+Penjelasan Logika Hybrid pada Kode handle_signal_alert:
+Bagian terpenting ada di fungsi handle_signal_alert (baris 186):
+Delay 5 Detik: await asyncio.sleep(SEND_DELAY) dipanggil pertama kali.
+Percobaan 1 (WebSocket Data):
+chart_file = await loop.run_in_executor(None, generate_chart, df, ...)
+Bot mencoba membuat chart dari df (data yang dikumpul dari WebSocket).
+Pengecekan Error: Jika chart_file is None (berarti data WS tidak cukup atau corrupt).
+Percobaan 2 (REST API Fallback):
+if chart_file is None:
+    log("...Mencoba REST API...")
+    df_fallback = await fetch_data_fallback(symbol, timeframe)
+    chart_file = await loop.run_in_executor(None, generate_chart, df_fallback, ...)
 
 
 
