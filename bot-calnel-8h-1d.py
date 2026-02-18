@@ -18,8 +18,8 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003726025593')
 
 # --- SETTING SCANNER ---
 TIMEFRAMES = ['8h', '1d']  # Scan 8 Jam dan 1 Hari
-TOP_N = 3                  # Ambil 3 Teratas (Gainer) dan 3 Terbawah (Loser)
-MIN_PERCENTAGE = 2.0       # Filter minimal pergerakan 2% (agar tidak kirim koin sideway)
+TOP_N = 10                  # Ambil 3 Teratas (Gainer) dan 3 Terbawah (Loser)
+MIN_PERCENTAGE = 2.5       # Filter minimal pergerakan 2% (agar tidak kirim koin sideway)
 
 # --- SETTING KEAMANAN (ANTI-BAN) ---
 BATCH_SIZE = 5      # Proses 5 koin per batch
