@@ -66,18 +66,29 @@ def generate_chart(df, symbol, timeframe, vol_status, oi_data=None):
         mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', inherit=True)
         s = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', y_on_right=True)
         
+        # Base AddPlots (MA di Panel 0)
         ap = [
             mpf.make_addplot(plot_df['MA5'], color='cyan', width=1, panel=0),
             mpf.make_addplot(plot_df['MA10'], color='orange', width=1, panel=0),
             mpf.make_addplot(plot_df['MA30'], color='purple', width=2, panel=0),
         ]
+        
+        # Dynamic Panel Logic
+        # Panel 0: Price
+        # Panel 1: Volume (karena volume=True)
+        ratios = [4, 1] 
+        current_panel = 2
 
         if 'OBV' in plot_df.columns:
-            ap.append(mpf.make_addplot(plot_df['OBV'], panel=2, color='blue', title='OBV', width=1.5, ylabel='OBV'))
+            ap.append(mpf.make_addplot(plot_df['OBV'], panel=current_panel, color='blue', title='OBV', width=1.5, ylabel='OBV'))
+            ratios.append(1)
+            current_panel += 1
 
         if oi_data is not None and not oi_data.empty:
             oi_aligned = oi_data.reindex(plot_df.index, method='ffill')
-            ap.append(mpf.make_addplot(oi_aligned, panel=3, color='#f1c40f', title='Open Interest', width=1.5, ylabel='OI'))
+            ap.append(mpf.make_addplot(oi_aligned, panel=current_panel, color='#f1c40f', title='Open Interest', width=1.5, ylabel='OI'))
+            ratios.append(1)
+            # current_panel += 1
 
         mpf.plot(
             plot_df, 
@@ -87,7 +98,7 @@ def generate_chart(df, symbol, timeframe, vol_status, oi_data=None):
             title=f"{symbol} ({timeframe}) - {vol_status}",
             savefig=dict(fname=filename, dpi=100, bbox_inches='tight'), 
             volume=True,
-            panel_ratios=(4,1,1,1),
+            panel_ratios=ratios, # Gunakan rasio dinamis
             figscale=1.2
         )
         return filename
