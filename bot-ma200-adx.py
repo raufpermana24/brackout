@@ -8,35 +8,35 @@ import json
 import threading
 import time
 import websocket
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 # ==========================================
-# 1. KONFIGURASI GLOBAL (WAJIB DI ATAS)
+# 1. KONFIGURASI PRIBADI (WAJIB DIISI)
 # ==========================================
-# Masukkan API Key & Token Telegram di sini jika tidak menggunakan environment variable
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97') 
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA') 
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003896189739') 
 
 # ==========================================
-# 2. KONFIGURASI STRATEGI
+# 2. KONFIGURASI ENDPOINT
 # ==========================================
-TIMEFRAME = '1h'           # H1
-ADX_THRESHOLD = 40         # Filter ADX > 40 (Super Strong Trend)
-LIMIT_CANDLES = 300        
-TOP_COINS_COUNT = 20       # Jumlah koin yang dipantau
+# Endpoint WebSocket & REST API Binance Futures
+WS_URL = "wss://fstream.binance.com/stream?streams="  # URL Default permintaan Anda
+REST_URL = "https://fapi.binance.com"                 # URL REST API Futures
 
 # ==========================================
-# 3. CLASS BOT UTAMA
+# 3. KONFIGURASI STRATEGI & SYSTEM
 # ==========================================
-class HybridBot:
+TIMEFRAME = '1h'           # H1
+ADX_THRESHOLD = 40         # Filter Tren Kuat
+LIMIT_CANDLES = 300        # Buffer Data Memory
+MAX_WORKERS = 10           # Thread CPU (5-10 untuk VPS standar)
+
+class BinanceFuturesBot:
     def __init__(self):
-        # Cek apakah API Key sudah diisi
-        if not BINANCE_API_KEY or "MASUKKAN" in BINANCE_API_KEY:
-            print("⚠️ PERINGATAN: API Key belum diisi dengan benar di bagian atas file!")
-            
-        # Inisialisasi REST API Client (ccxt)
+        # 1. Setup Exchange (REST API untuk Order/History)
         try:
             self.exchange = ccxt.binance({
                 'apiKey': BINANCE_API_KEY,
@@ -44,242 +44,280 @@ class HybridBot:
                 'enableRateLimit': True,
                 'options': {'defaultType': 'future'}
             })
-            print(f"✅ Hybrid Bot Siap. Mode: WebSocket + REST Fallback.")
+            # Opsional: Jika ingin memaksa URL custom untuk ccxt (biasanya tidak perlu karena ccxt sudah handle)
+            # self.exchange.urls['api']['fapiPublic'] = REST_URL 
+            
+            print(f"✅ Bot Started via CCXT & WebSocket.")
         except Exception as e:
-            print(f"❌ Gagal inisialisasi Exchange: {e}")
+            print(f"❌ Error Init: {e}")
 
-        # Data Store Lokal (Untuk pemantauan WebSocket cepat)
+        # 2. Memory Storage (Database RAM)
         self.local_data = {} 
         self.active_symbols = []
         
-        self.send_telegram_text(f"🚀 **Hybrid Bot Started!**\nStrategy: ADX > {ADX_THRESHOLD} Only")
+        # 3. Thread Pool (Otak Pemroses Paralel)
+        self.executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        
+        # Kirim Notif Start
+        self.send_telegram_text(f"🚀 **Bot Futures WebSocket Running!**\nStrategy: Candle Pattern + ADX > {ADX_THRESHOLD}")
 
-    # -----------------------------------------------------------
-    # BAGIAN 1: FUNGSI UTILITAS & REST API (Untuk Data Bersih)
-    # -----------------------------------------------------------
-    def get_top_volume_pairs(self):
-        """Mengambil Top Koin via REST API"""
+    # =====================================================
+    # BAGIAN 1: MANAJEMEN DATA (REST API)
+    # =====================================================
+    def get_all_usdt_pairs(self):
+        """Mengambil semua pair USDT Futures"""
         try:
             tickers = self.exchange.fetch_tickers()
-            usdt_pairs = {k: v for k, v in tickers.items() if '/USDT' in k}
-            sorted_pairs = sorted(usdt_pairs.items(), key=lambda x: x[1]['quoteVolume'], reverse=True)
-            return [pair[0] for pair in sorted_pairs[:TOP_COINS_COUNT]]
-        except Exception as e:
-            print(f"⚠️ Gagal fetch pairs: {e}")
-            return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT']
+            pairs = [s for s in tickers.keys() if '/USDT' in s]
+            print(f"📊 Market Loaded: {len(pairs)} Pairs.")
+            return pairs
+        except: return ['BTC/USDT', 'ETH/USDT']
 
-    def fetch_rest_data(self, symbol):
-        """Mengambil data bersih via REST API."""
+    def fetch_initial_history(self, symbol):
+        """Ambil 300 candle terakhir untuk isi awal Memory"""
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=LIMIT_CANDLES)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             return df
-        except Exception as e:
-            print(f"❌ REST API Error {symbol}: {e}")
-            return None
+        except: return None
 
+    # =====================================================
+    # BAGIAN 2: LOGIKA ANALISIS (THREAD WORKER)
+    # =====================================================
     def calculate_indicators(self, df):
-        """Menghitung Indikator Strategi"""
-        # HLC3
+        # HLC3 & MA Zones
         df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
-
-        # MA200 Dynamic Zone
         df['ma200_hlc3'] = ta.sma(df['hlc3'], length=200)
         df['ma200_high'] = ta.sma(df['high'], length=200)
         df['ma200_low'] = ta.sma(df['low'], length=200)
 
-        # Momentum
+        # Momentum & ADX
         df['ma20'] = ta.sma(df['hlc3'], length=20)
         df['ma10'] = ta.sma(df['hlc3'], length=10)
-
-        # ADX
         adx = ta.adx(df['high'], df['low'], df['close'], length=14)
         df['adx'] = adx['ADX_14']
         
-        # Slope (Kemiringan)
+        # Slope
         df['slope_ma200'] = df['ma200_hlc3'].diff()
-        df['slope_ma20'] = df['ma20'].diff()
         df['slope_ma10'] = df['ma10'].diff()
         
         return df
 
     def detect_pattern(self, curr, prev):
-        """Deteksi Pin Bar & Engulfing"""
         body = abs(curr['close'] - curr['open'])
         upper_wick = curr['high'] - max(curr['close'], curr['open'])
         lower_wick = min(curr['close'], curr['open']) - curr['low']
+        if body == 0: return None
+
+        # Pin Bar
+        if lower_wick >= (2 * body) and upper_wick <= (0.5 * body): return "PINBAR_BULLISH"
+        if upper_wick >= (2 * body) and lower_wick <= (0.5 * body): return "PINBAR_BEARISH"
         
-        pattern = None
-        # Pin Bar Logic
-        if lower_wick >= (2 * body) and upper_wick <= (0.5 * body): pattern = "PINBAR_BULLISH"
-        elif upper_wick >= (2 * body) and lower_wick <= (0.5 * body): pattern = "PINBAR_BEARISH"
-        # Engulfing Logic
+        # Engulfing
         if (curr['close'] > curr['open']) and (prev['close'] < prev['open']):
-            if (curr['close'] > prev['open']) and (curr['open'] < prev['close']): pattern = "BULLISH_ENGULFING"
-        elif (curr['close'] < curr['open']) and (prev['close'] > prev['open']):
-            if (curr['close'] < prev['open']) and (curr['open'] > prev['close']): pattern = "BEARISH_ENGULFING"
-        return pattern
+            if (curr['close'] > prev['open']) and (curr['open'] < prev['close']): return "BULLISH_ENGULFING"
+        if (curr['close'] < curr['open']) and (prev['close'] > prev['open']):
+            if (curr['close'] < prev['open']) and (curr['open'] > prev['close']): return "BEARISH_ENGULFING"
+            
+        return None
 
-    # -----------------------------------------------------------
-    # BAGIAN 2: LOGIKA SINYAL
-    # -----------------------------------------------------------
-    def check_signal_logic(self, symbol, df):
-        if len(df) < 205: return
-
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        
-        # FILTER: Strict ADX Threshold
-        if last['adx'] <= ADX_THRESHOLD:
-            return 
-
-        pattern = self.detect_pattern(last, prev)
-        if not pattern: return 
-
-        price = last['close']
-        signal = None
-        
-        # --- LOGIKA LONG ---
-        trend_up = (price > last['ma200_hlc3']) and (last['slope_ma200'] > 0)
-        struct_up = price > last['ma200_low']
-        mom_up = (last['ma10'] > last['ma20']) and (last['slope_ma10'] > 0)
-        pullback_up = last['low'] <= last['ma10']
-        
-        if trend_up and struct_up and mom_up and pullback_up and pattern in ["PINBAR_BULLISH", "BULLISH_ENGULFING"]:
-            signal = "LONG 🟢"
-
-        # --- LOGIKA SHORT ---
-        trend_down = (price < last['ma200_hlc3']) and (last['slope_ma200'] < 0)
-        struct_down = price < last['ma200_high']
-        mom_down = (last['ma10'] < last['ma20']) and (last['slope_ma10'] < 0)
-        pullback_down = last['high'] >= last['ma10']
-        
-        if trend_down and struct_down and mom_down and pullback_down and pattern in ["PINBAR_BEARISH", "BEARISH_ENGULFING"]:
-            signal = "SHORT 🔴"
-
-        # JIKA SINYAL VALID
-        if signal:
-            print(f"⚡ Sinyal Terdeteksi: {symbol} | {signal} | ADX: {round(last['adx'],1)}")
-            t = threading.Thread(target=self.process_verified_alert, args=(symbol, signal, pattern))
-            t.start()
-
-    def process_verified_alert(self, symbol, signal, pattern):
+    def process_data_logic(self, symbol, df):
+        """Fungsi ini berjalan di background thread"""
         try:
-            df_fresh = self.fetch_rest_data(symbol)
-            if df_fresh is not None:
-                df_fresh = self.calculate_indicators(df_fresh)
-                last_data = df_fresh.iloc[-1]
-                
-                filename = f"chart_{symbol.replace('/','_')}_{int(time.time())}.png"
-                self.generate_chart(df_fresh, symbol, f"{signal} - {pattern}", filename)
-                
-                msg = (
-                    f"*{signal} SIGNAL VERIFIED*\n"
-                    f"Asset: `{symbol}`\n"
-                    f"Price: `{last_data['close']}`\n"
-                    f"Trigger: `{pattern}`\n"
-                    f"ADX: `{round(last_data['adx'], 2)}` (Strong Trend)\n"
+            if len(df) < 205: return
+
+            # 1. Hitung Indikator
+            df = self.calculate_indicators(df)
+            self.local_data[symbol] = df # Update Memory Utama
+
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+
+            # 2. Filter ADX (Hemat resource: jika tren lemah, stop)
+            if last['adx'] <= ADX_THRESHOLD: return
+
+            # 3. Cek Pattern Candle
+            pattern = self.detect_pattern(last, prev)
+            if not pattern: return
+
+            # 4. Cek Konfluensi (Trend + Momentum + Support/Resist)
+            price = last['close']
+            signal = None
+
+            # Logic Long
+            if pattern in ["PINBAR_BULLISH", "BULLISH_ENGULFING"]:
+                if (price > last['ma200_hlc3']) and (last['slope_ma200'] > 0) and \
+                   (price > last['ma200_low']) and \
+                   (last['ma10'] > last['ma20']) and (last['slope_ma10'] > 0) and \
+                   (last['low'] <= last['ma10']): # Pullback
+                    signal = "LONG 🟢"
+
+            # Logic Short
+            elif pattern in ["PINBAR_BEARISH", "BEARISH_ENGULFING"]:
+                if (price < last['ma200_hlc3']) and (last['slope_ma200'] < 0) and \
+                   (price < last['ma200_high']) and \
+                   (last['ma10'] < last['ma20']) and (last['slope_ma10'] < 0) and \
+                   (last['high'] >= last['ma10']): # Pullback
+                    signal = "SHORT 🔴"
+
+            # 5. Eksekusi Sinyal
+            if signal:
+                print(f"🔥 SIGNAL: {symbol} | {signal}")
+                # Kirim ke Thread Alerting
+                self.send_alert(symbol, signal, pattern, last, df)
+
+        except Exception as e: pass
+
+    def send_alert(self, symbol, signal, pattern, data, df):
+        """Generate Chart & Kirim Telegram"""
+        try:
+            filename = f"chart_{symbol.replace('/','')}_{int(time.time())}.png"
+            
+            # Setup Chart Style
+            plot_df = df.tail(60).set_index('timestamp')
+            mc = mpf.make_marketcolors(up='#089981', down='#F23645', inherit=True)
+            s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc)
+            
+            apds = [
+                mpf.make_addplot(plot_df['ma200_hlc3'], color='white', width=1.5, panel=0),
+                mpf.make_addplot(plot_df['ma10'], color='#FFD700', width=1, panel=0),
+                mpf.make_addplot(plot_df['ma20'], color='#00E5FF', width=1, panel=0),
+                mpf.make_addplot(plot_df['adx'], color='magenta', panel=1)
+            ]
+            
+            # Render Gambar
+            mpf.plot(plot_df, type='candle', style=s, addplot=apds, title=f"{symbol} {signal}",
+                     savefig=dict(fname=filename, dpi=100, bbox_inches='tight'), volume=False, panel_ratios=(6,2))
+            
+            # Kirim Telegram
+            caption = (
+                f"*{signal} SIGNAL DETECTED*\n"
+                f"Asset: `{symbol}`\n"
+                f"Price: `{data['close']}`\n"
+                f"Pattern: `{pattern}`\n"
+                f"ADX: `{round(data['adx'], 2)}`\n"
+                f"Source: WebSocket Realtime"
+            )
+            
+            with open(filename, 'rb') as img:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                    data={'chat_id': TELEGRAM_CHAT_ID, 'caption': caption, 'parse_mode': 'Markdown'},
+                    files={'photo': img}
                 )
-                self.send_telegram_photo(msg, filename)
-                print(f"✅ Alert {symbol} sent.")
-            else:
-                print(f"⚠️ Gagal verifikasi REST API untuk {symbol}")
-        except Exception as e:
-            print(f"❌ Error Alert: {e}")
+            os.remove(filename) # Hapus file
+            
+        except Exception as e: print(f"Alert Error: {e}")
 
-    def generate_chart(self, df, symbol, title, filename):
-        plot_df = df.tail(60).set_index('timestamp')
-        mc = mpf.make_marketcolors(up='#089981', down='#F23645', inherit=True)
-        s = mpf.make_mpf_style(base_mpf_style='nightclouds', marketcolors=mc)
-        apds = [
-            mpf.make_addplot(plot_df['ma200_hlc3'], color='white', width=1.5, panel=0),
-            mpf.make_addplot(plot_df['ma10'], color='#FFD700', width=1, panel=0),
-            mpf.make_addplot(plot_df['ma20'], color='#00E5FF', width=1, panel=0),
-            mpf.make_addplot(plot_df['adx'], color='magenta', panel=1)
-        ]
-        mpf.plot(plot_df, type='candle', style=s, addplot=apds, title=title,
-                 savefig=dict(fname=filename, dpi=100, bbox_inches='tight'), volume=False, panel_ratios=(6,2))
-
-    # -----------------------------------------------------------
-    # BAGIAN 3: WEBSOCKET
-    # -----------------------------------------------------------
+    # =====================================================
+    # BAGIAN 3: WEBSOCKET ENGINE (CORE)
+    # =====================================================
     def on_message(self, ws, message):
+        """Menangkap Data Realtime"""
         try:
             json_msg = json.loads(message)
+            # Cek apakah tipe data adalah Kline/Candle
             if 'e' in json_msg and json_msg['e'] == 'kline':
-                kline = json_msg['k']
-                if kline['x']:
-                    symbol_raw = json_msg['s']
-                    symbol_fmt = symbol_raw[:-4] + "/USDT"
+                k = json_msg['k']
+                
+                # HANYA PROSES SAAT CANDLE CLOSE (x = True)
+                if k['x']:
+                    symbol_raw = json_msg['s'] # BTCUSDT
+                    symbol_fmt = symbol_raw[:-4] + "/USDT" # BTC/USDT
                     
                     new_row = {
-                        'timestamp': pd.to_datetime(kline['t'], unit='ms'),
-                        'open': float(kline['o']), 'high': float(kline['h']),
-                        'low': float(kline['l']), 'close': float(kline['c']),
-                        'volume': float(kline['v'])
+                        'timestamp': pd.to_datetime(k['t'], unit='ms'),
+                        'open': float(k['o']), 'high': float(k['h']),
+                        'low': float(k['l']), 'close': float(k['c']),
+                        'volume': float(k['v'])
                     }
                     
+                    # Update Memory DataFrame
                     if symbol_fmt in self.local_data:
                         df = self.local_data[symbol_fmt]
                         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                        if len(df) > 305: df = df.iloc[1:]
                         
-                        df = self.calculate_indicators(df)
-                        self.local_data[symbol_fmt] = df
+                        # Jaga ukuran memori (Hapus data lama)
+                        if len(df) > LIMIT_CANDLES: df = df.iloc[1:]
                         
-                        self.check_signal_logic(symbol_fmt, df)
-                        print(f"💧 WS: {symbol_fmt} Close: {new_row['close']}")
-        except Exception as e:
-            print(f"WS Error: {e}")
+                        # Lempar ke Thread Pool untuk dianalisis
+                        # .copy() penting agar data thread-safe
+                        self.executor.submit(self.process_data_logic, symbol_fmt, df.copy())
+                        
+        except Exception: pass
 
     def on_error(self, ws, error):
-        print(f"Websocket Error: {error}")
+        print(f"⚠️ WS Error: {error}")
 
-    def on_close(self, ws, *args):
-        print("Websocket Reconnecting...")
-        time.sleep(5)
-        self.run()
+    def on_close(self, ws, close_status_code, close_msg):
+        print("🔌 WebSocket Disconnected.")
 
     def on_open(self, ws):
-        print("✅ WebSocket Connected. Subscribing...")
-        params = []
+        print("📡 WebSocket Connected! Subscribing streams...")
+        
+        # Batch Subscribe (Mencegah Request Limit)
+        batch_size = 50
+        all_params = []
+        
         for symbol in self.active_symbols:
-            clean_symbol = symbol.replace('/', '').lower()
-            params.append(f"{clean_symbol}@kline_{TIMEFRAME}")
-        ws.send(json.dumps({"method": "SUBSCRIBE", "params": params, "id": 1}))
+            clean = symbol.replace('/', '').lower()
+            all_params.append(f"{clean}@kline_{TIMEFRAME}")
+            
+        # Kirim per batch
+        for i in range(0, len(all_params), batch_size):
+            batch = all_params[i:i + batch_size]
+            payload = {"method": "SUBSCRIBE", "params": batch, "id": i+1}
+            ws.send(json.dumps(payload))
+            time.sleep(0.5)
+            
+        print(f"✅ Subscribed to {len(all_params)} streams.")
 
     def run(self):
-        print("1. Mengambil Top Coins...")
-        self.active_symbols = self.get_top_volume_pairs()
+        # 1. Ambil List Semua Koin
+        self.active_symbols = self.get_all_usdt_pairs()
         
-        print("2. Pre-load Data Historis...")
+        # 2. Isi Data Awal (Warming Up Memory)
+        print("⏳ Loading initial history (Rest API)...")
+        count = 0
         for sym in self.active_symbols:
-            df = self.fetch_rest_data(sym)
+            df = self.fetch_initial_history(sym)
             if df is not None:
+                # Pre-calculate indicator
                 df = self.calculate_indicators(df)
                 self.local_data[sym] = df
-                print(f"   Loaded: {sym}")
-            time.sleep(0.2)
+                count += 1
+                print(f"\rLoaded {count}/{len(self.active_symbols)}", end="", flush=True)
+            time.sleep(0.05) # Delay dikit biar aman
+            
+        print("\n✅ Memory Ready. Starting WebSocket Loop...")
 
-        print("3. Memulai WebSocket...")
-        socket_url = "wss://fstream.binance.com/ws"
-        ws = websocket.WebSocketApp(socket_url,
-                                    on_open=self.on_open,
-                                    on_message=self.on_message,
-                                    on_error=self.on_error,
-                                    on_close=self.on_close)
-        ws.run_forever()
-
-    def send_telegram_photo(self, message, image_path):
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-            with open(image_path, 'rb') as img:
-                payload = {'chat_id': TELEGRAM_CHAT_ID, 'caption': message, 'parse_mode': 'Markdown'}
-                files = {'photo': img}
-                requests.post(url, data=payload, files=files)
-            os.remove(image_path)
-        except Exception as e: print(f"Telegram Fail: {e}")
+        # 3. Main Loop (Auto Reconnect)
+        while True:
+            try:
+                # Menentukan URL WebSocket
+                # Jika WS_URL di set ke "stream?streams=" tapi kita menggunakan metode SUBSCRIBE JSON,
+                # kita harus menggunakan base endpoint /ws agar tidak error saat handshake.
+                target_ws_url = WS_URL
+                if "stream?streams=" in target_ws_url and target_ws_url.endswith("="):
+                    target_ws_url = "wss://fstream.binance.com/ws"
+                
+                # Hubungkan ke Binance Futures Stream
+                ws = websocket.WebSocketApp(
+                    target_ws_url,
+                    on_open=self.on_open,
+                    on_message=self.on_message,
+                    on_error=self.on_error,
+                    on_close=self.on_close
+                )
+                # Jalankan dengan Ping Interval 60 detik (Anti Putus)
+                ws.run_forever(ping_interval=60, ping_timeout=10)
+                
+            except Exception as e:
+                print(f"Critical Error: {e}")
+            
+            print("🔄 Reconnecting in 5 seconds...")
+            time.sleep(5)
 
     def send_telegram_text(self, message):
         try:
@@ -289,7 +327,7 @@ class HybridBot:
 
 if __name__ == "__main__":
     try:
-        bot = HybridBot()
+        bot = BinanceFuturesBot()
         bot.run()
     except KeyboardInterrupt:
         print("Bot Stopped.")
