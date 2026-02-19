@@ -8,6 +8,8 @@ import os
 import time
 import sys
 import traceback
+import matplotlib # Import matplotlib
+matplotlib.use('Agg') # WAJIB: Mode tanpa layar (Headless) untuk VPS/Server
 from datetime import datetime
 from io import BytesIO
 
@@ -17,10 +19,11 @@ BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNow
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8562793193:AAHDulfzVhhnuPfNfy4Zk6ONBNSNbGwVJ8c')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003819540522')
 
+
 # Konfigurasi Scanner
-TOP_COINS = 40          # Pantau 40 Koin Teratas
-TIMEFRAMES = ['1h', '4h', '6h'] # Fokus Timeframe Besar
-LIMIT_HISTORY = 120     # Buffer history
+TOP_COINS = 40          
+TIMEFRAMES = ['1h', '4h', '6h'] 
+LIMIT_HISTORY = 120     
 
 # Endpoint
 WS_URL = "wss://fstream.binance.com/stream?streams="
@@ -56,22 +59,39 @@ async def send_photo_async(session, caption, file_path):
             form.add_field('photo', f, filename='chart.png')
             
             async with session.post(url, data=form) as resp:
-                await resp.text()
+                result = await resp.text()
+                # log(f"Telegram Resp: {result}") # Uncomment untuk debug
     except Exception as e:
         log(f"[TG FOTO ERROR] {e}")
 
-# ================= CHARTING ENGINE =================
+# ================= CHARTING ENGINE (FIXED) =================
 def generate_chart_task(df, symbol, timeframe, extra_info):
+    """
+    Fungsi Chart dengan Error Logging & Mode Headless
+    """
     filename = f"chart_{symbol}_{timeframe}_{int(time.time())}.png"
     try:
-        if df is None or len(df) < 50: return None
+        # 1. Validasi Data Minimal
+        if df is None or len(df) < 50: 
+            log(f"⚠️ Data kurang untuk chart {symbol} (Len: {len(df) if df is not None else 0})")
+            return None
 
+        # 2. Copy & Indexing
         plot_df = df.tail(80).copy()
         if 'timestamp' in plot_df.columns:
             plot_df.set_index('timestamp', inplace=True)
         
+        # Pastikan index tipe Datetime
+        if not isinstance(plot_df.index, pd.DatetimeIndex):
+            plot_df.index = pd.to_datetime(plot_df.index)
+
+        # 3. Styling
         mc = mpf.make_marketcolors(up='#2ebd85', down='#f6465d', edge='i', wick='i', volume='in', inherit=True)
         s = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', y_on_right=True)
+
+        # 4. Plots (MA, BB, RSI)
+        # Handle jika kolom belum ada (mencegah crash)
+        if 'MA5' not in plot_df.columns: return None
 
         add_plots = [
             mpf.make_addplot(plot_df['MA5'], color='cyan', width=1.0, panel=0),
@@ -84,6 +104,7 @@ def generate_chart_task(df, symbol, timeframe, extra_info):
 
         fill_bb = dict(y1=plot_df['BB_Upper'].values, y2=plot_df['BB_Lower'].values, color='gray', alpha=0.1)
 
+        # 5. Generate
         mpf.plot(
             plot_df, type='candle', style=s, addplot=add_plots, volume=True,
             title=f"\n{symbol} ({timeframe}) {extra_info}",
@@ -93,12 +114,16 @@ def generate_chart_task(df, symbol, timeframe, extra_info):
             savefig=dict(fname=filename, dpi=80, bbox_inches='tight')
         )
         return filename
-    except Exception:
+
+    except Exception as e:
+        log(f"❌ CHART GENERATION ERROR ({symbol}): {e}")
+        traceback.print_exc() # Print detail error ke terminal
         return None
 
 # ================= INDIKATOR =================
 def calculate_indicators(df):
     try:
+        # MA
         df['MA5'] = df['close'].rolling(window=5).mean()
         df['MA10'] = df['close'].rolling(window=10).mean()
         df['MA30'] = df['close'].rolling(window=30).mean()
@@ -152,9 +177,6 @@ async def fetch_data_fallback(session, symbol, timeframe):
 # ================= LOGIKA UTAMA =================
 
 async def handle_alert_async(symbol, timeframe, signal_type, signal_side, df, vol_desc, is_startup=False):
-    """
-    Menangani Alert: Charting & Sending
-    """
     log(f"🔔 DETECTED ({'STARTUP' if is_startup else 'LIVE'}): {symbol} {signal_type} ({timeframe})")
     
     loop = asyncio.get_running_loop()
@@ -166,6 +188,7 @@ async def handle_alert_async(symbol, timeframe, signal_type, signal_side, df, vo
     async with aiohttp.ClientSession() as session:
         # Fallback Check jika chart gagal
         if chart_file is None:
+             log(f"⚠️ Chart WebSocket gagal. Mencoba ambil data baru via REST...")
              df_fallback = await fetch_data_fallback(session, symbol, timeframe)
              if df_fallback is not None:
                  chart_file = await loop.run_in_executor(None, generate_chart_task, df_fallback, symbol, timeframe, f"| {vol_desc} (R)")
@@ -199,19 +222,15 @@ async def handle_alert_async(symbol, timeframe, signal_type, signal_side, df, vo
             try: os.remove(chart_file)
             except: pass
         else:
+            log("❌ Gagal membuat chart sama sekali. Mengirim pesan teks.")
             await send_telegram_async(session, caption)
 
 async def analyze_logic(symbol, timeframe, df, is_startup=False):
-    """
-    Logika Analisa Sinyal
-    """
     last = df.iloc[-1]
     prev = df.iloc[-2]
     candle_ts = last['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
 
     # Filter Volume (Untuk mengurangi spam)
-    # Jika Startup: Kita sedikit longgarkan filternya atau tetap ketat, tergantung preferensi.
-    # Di sini kita pakai logika yang sama.
     avg_vol = last['VolMA']
     if avg_vol == 0: return
     vol_ratio = last['volume'] / avg_vol
@@ -234,8 +253,6 @@ async def analyze_logic(symbol, timeframe, df, is_startup=False):
         signal_type, signal_side, has_alert = 'EXTREME_VOL', 'INFO ⚠️', True
 
     if has_alert:
-        # Unik ID ditambah is_startup agar beda konteks jika perlu, 
-        # tapi biasanya kita tetap mau filter duplikat.
         sig_id = f"{symbol}_{timeframe}_{candle_ts}_{signal_type}"
         
         if sig_id not in SENT_SIGNALS:
@@ -314,14 +331,12 @@ async def initialize_and_scan_startup(symbols):
                             df.columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
                             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
                             
-                            # Hitung Indikator
                             df = calculate_indicators(df)
                             
                             if sym not in DATA_STORE: DATA_STORE[sym] = {}
                             DATA_STORE[sym][tf] = df
                             
                             # === STARTUP SCAN ===
-                            # Langsung analisa data yang baru didownload tanpa menunggu close candle
                             await analyze_logic(sym, tf, df, is_startup=True)
                             
                 except: pass
@@ -343,14 +358,14 @@ async def get_top_symbols():
     return [x['symbol'] for x in futures[:TOP_COINS]]
 
 async def main():
-    log("=== BOT FUTURES (Instant Startup + Live Close) ===")
+    log("=== BOT FUTURES (Chart Fix & Headless) ===")
     symbols = await get_top_symbols()
     if not symbols: return
 
     # 1. Download Data & Scan Langsung (Startup Phase)
     await initialize_and_scan_startup(symbols)
     
-    # 2. Masuk ke Mode WebSocket (Live Phase - Close Candle Only)
+    # 2. Masuk ke Mode WebSocket (Live Phase)
     all_streams = [f"{sym.lower()}@kline_{tf}" for sym in symbols for tf in TIMEFRAMES]
     BATCH = 50
     tasks = []
