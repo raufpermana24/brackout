@@ -29,7 +29,7 @@ REST_URL = "https://fapi.binance.com"                 # URL REST API Futures
 # ==========================================
 # 3. KONFIGURASI STRATEGI & SYSTEM
 # ==========================================
-TIMEFRAME = '1h'           # H1
+TIMEFRAME = '15m'           # H1
 ADX_THRESHOLD = 40         # Filter Tren Kuat
 LIMIT_CANDLES = 300        # Buffer Data Memory
 MAX_WORKERS = 10           # Thread CPU (5-10 untuk VPS standar)
