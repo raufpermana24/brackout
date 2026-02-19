@@ -8,10 +8,9 @@ import os
 import time
 import sys
 import traceback
-import matplotlib # Import matplotlib
-matplotlib.use('Agg') # WAJIB: Mode tanpa layar (Headless) untuk VPS/Server
+import matplotlib
+matplotlib.use('Agg') # Mode Headless (Wajib untuk VPS)
 from datetime import datetime
-from io import BytesIO
 
 # ================= KONFIGURASI =================
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97')
@@ -19,11 +18,11 @@ BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNow
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8562793193:AAHDulfzVhhnuPfNfy4Zk6ONBNSNbGwVJ8c')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003819540522')
 
-
 # Konfigurasi Scanner
 TOP_COINS = 40          
 TIMEFRAMES = ['1h', '4h', '6h'] 
 LIMIT_HISTORY = 120     
+SEND_DELAY = 5          
 
 # Endpoint
 WS_URL = "wss://fstream.binance.com/stream?streams="
@@ -59,21 +58,20 @@ async def send_photo_async(session, caption, file_path):
             form.add_field('photo', f, filename='chart.png')
             
             async with session.post(url, data=form) as resp:
-                result = await resp.text()
-                # log(f"Telegram Resp: {result}") # Uncomment untuk debug
+                await resp.text()
     except Exception as e:
         log(f"[TG FOTO ERROR] {e}")
 
 # ================= CHARTING ENGINE (FIXED) =================
 def generate_chart_task(df, symbol, timeframe, extra_info):
     """
-    Fungsi Chart dengan Error Logging & Mode Headless
+    Fungsi Chart yang SUDAH DIPERBAIKI (Fix error hlines panel)
     """
     filename = f"chart_{symbol}_{timeframe}_{int(time.time())}.png"
     try:
         # 1. Validasi Data Minimal
         if df is None or len(df) < 50: 
-            log(f"⚠️ Data kurang untuk chart {symbol} (Len: {len(df) if df is not None else 0})")
+            # log(f"⚠️ Data kurang untuk chart {symbol}")
             return None
 
         # 2. Copy & Indexing
@@ -90,16 +88,25 @@ def generate_chart_task(df, symbol, timeframe, extra_info):
         s = mpf.make_mpf_style(marketcolors=mc, gridstyle=':', y_on_right=True)
 
         # 4. Plots (MA, BB, RSI)
-        # Handle jika kolom belum ada (mencegah crash)
         if 'MA5' not in plot_df.columns: return None
 
+        # Siapkan garis konstan untuk batas RSI (Pengganti hlines)
+        line_70 = [70] * len(plot_df)
+        line_30 = [30] * len(plot_df)
+
         add_plots = [
+            # Panel 0: MA & BB
             mpf.make_addplot(plot_df['MA5'], color='cyan', width=1.0, panel=0),
             mpf.make_addplot(plot_df['MA10'], color='orange', width=1.0, panel=0),
             mpf.make_addplot(plot_df['MA30'], color='magenta', width=2.0, panel=0),
             mpf.make_addplot(plot_df['BB_Upper'], color='gray', width=0.5, panel=0),
             mpf.make_addplot(plot_df['BB_Lower'], color='gray', width=0.5, panel=0),
-            mpf.make_addplot(plot_df['RSI'], panel=2, color='#b48eff', ylabel='RSI', width=1.5, ylim=(0, 100))
+            
+            # Panel 2: RSI & Batasnya (FIX ERROR DI SINI)
+            mpf.make_addplot(plot_df['RSI'], panel=2, color='#b48eff', ylabel='RSI', width=1.5, ylim=(0, 100)),
+            # Menggambar garis batas manual menggunakan make_addplot
+            mpf.make_addplot(line_70, panel=2, color='#ff5252', width=0.8, linestyle='--'),
+            mpf.make_addplot(line_30, panel=2, color='#69f0ae', width=0.8, linestyle='--'),
         ]
 
         fill_bb = dict(y1=plot_df['BB_Upper'].values, y2=plot_df['BB_Lower'].values, color='gray', alpha=0.1)
@@ -110,14 +117,14 @@ def generate_chart_task(df, symbol, timeframe, extra_info):
             title=f"\n{symbol} ({timeframe}) {extra_info}",
             panel_ratios=(6, 2, 2), tight_layout=True, datetime_format='%H:%M',
             fill_between=[fill_bb, dict(y1=30, y2=70, color='#2c2c2c', alpha=0.1, panel=2)],
-            hlines=dict(hlines=[70, 30], colors=['#ff5252', '#69f0ae'], linestyle='--', linewidths=1.0, panel=2),
-            savefig=dict(fname=filename, dpi=80, bbox_inches='tight')
+            # Hapus argument hlines yang menyebabkan error
+            savefig=dict(fname=filename, dpi=100, bbox_inches='tight')
         )
         return filename
 
     except Exception as e:
         log(f"❌ CHART GENERATION ERROR ({symbol}): {e}")
-        traceback.print_exc() # Print detail error ke terminal
+        # traceback.print_exc() 
         return None
 
 # ================= INDIKATOR =================
@@ -181,19 +188,16 @@ async def handle_alert_async(symbol, timeframe, signal_type, signal_side, df, vo
     
     loop = asyncio.get_running_loop()
     
-    # 1. Generate Chart (Coba data Memory dulu)
+    # 1. Generate Chart
     chart_file = await loop.run_in_executor(None, generate_chart_task, df, symbol, timeframe, f"| {vol_desc}")
     
     # 2. Kirim via Aiohttp
     async with aiohttp.ClientSession() as session:
-        # Fallback Check jika chart gagal
         if chart_file is None:
-             log(f"⚠️ Chart WebSocket gagal. Mencoba ambil data baru via REST...")
              df_fallback = await fetch_data_fallback(session, symbol, timeframe)
              if df_fallback is not None:
                  chart_file = await loop.run_in_executor(None, generate_chart_task, df_fallback, symbol, timeframe, f"| {vol_desc} (R)")
 
-        # Prepare Caption
         last = df.iloc[-1]
         price = last['close']
         rsi_stat = "OVERBOUGHT" if last['RSI'] > 70 else "OVERSOLD" if last['RSI'] < 30 else "Neutral"
@@ -222,7 +226,6 @@ async def handle_alert_async(symbol, timeframe, signal_type, signal_side, df, vo
             try: os.remove(chart_file)
             except: pass
         else:
-            log("❌ Gagal membuat chart sama sekali. Mengirim pesan teks.")
             await send_telegram_async(session, caption)
 
 async def analyze_logic(symbol, timeframe, df, is_startup=False):
@@ -230,7 +233,6 @@ async def analyze_logic(symbol, timeframe, df, is_startup=False):
     prev = df.iloc[-2]
     candle_ts = last['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
 
-    # Filter Volume (Untuk mengurangi spam)
     avg_vol = last['VolMA']
     if avg_vol == 0: return
     vol_ratio = last['volume'] / avg_vol
@@ -243,7 +245,6 @@ async def analyze_logic(symbol, timeframe, df, is_startup=False):
     vol_desc = f"🔥 HIGH ({vol_ratio:.1f}x)" if is_high_vol else f"❄️ LOW"
     signal_type, signal_side, has_alert = None, None, False
 
-    # Logic
     if prev['MA5'] <= prev['MA10'] and last['MA5'] > last['MA10']:
         signal_type, signal_side, has_alert = 'GOLDEN_CROSS', 'LONG 🟢', True
     elif (last['low'] <= last['MA30'] <= last['high']):
@@ -258,14 +259,11 @@ async def analyze_logic(symbol, timeframe, df, is_startup=False):
         if sig_id not in SENT_SIGNALS:
             SENT_SIGNALS.add(sig_id)
             if len(SENT_SIGNALS) > 5000: SENT_SIGNALS.clear()
-            
-            # Fire alert task
             asyncio.create_task(handle_alert_async(symbol, timeframe, signal_type, signal_side, df, vol_desc, is_startup))
 
 # ================= WEBSOCKET HANDLER =================
 
 async def process_stream_data(symbol, timeframe, kline):
-    # Mode Live: Hanya proses jika candle close
     if not kline['x']: return 
 
     try:
@@ -289,7 +287,6 @@ async def process_stream_data(symbol, timeframe, kline):
         df = calculate_indicators(df)
         DATA_STORE[symbol][timeframe] = df
 
-        # Trigger Live Analysis
         await analyze_logic(symbol, timeframe, df, is_startup=False)
 
     except Exception:
@@ -358,7 +355,7 @@ async def get_top_symbols():
     return [x['symbol'] for x in futures[:TOP_COINS]]
 
 async def main():
-    log("=== BOT FUTURES (Chart Fix & Headless) ===")
+    log("=== BOT FUTURES (Chart Fixed) ===")
     symbols = await get_top_symbols()
     if not symbols: return
 
@@ -381,5 +378,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Stopped")
-
-
+`
