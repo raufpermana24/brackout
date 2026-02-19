@@ -14,18 +14,15 @@ from datetime import datetime
 # KONFIGURASI API & TELEGRAM
 # ==========================================
 # Pastikan API Key diisi agar bisa akses Futures
-API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97')
-API_SECRET = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
-
-# Telegram Config (Isi manual jika tidak pakai env var)
+BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97') 
+BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA') 
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003896189739')
- 
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003896189739') 
 
 # ==========================================
 # KONFIGURASI STRATEGI
 # ==========================================
-TIMEFRAME = '15m'           # H1
+TIMEFRAME = '1h'           # H1
 ADX_THRESHOLD = 25         
 LIMIT_CANDLES = 300        
 TOP_COINS_COUNT = 20       # Jumlah koin yang dipantau
