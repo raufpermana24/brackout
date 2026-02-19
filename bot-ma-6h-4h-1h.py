@@ -19,7 +19,7 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003819540522')
 
 
 # Konfigurasi Scanner
-TOP_COINS = 250          # Pantau 40 Koin Teratas
+TOP_COINS = 40          # Pantau 40 Koin Teratas
 TIMEFRAMES = ['1h', '4h', '6h'] # Timeframe Besar
 LIMIT_HISTORY = 120     # Buffer history
 
