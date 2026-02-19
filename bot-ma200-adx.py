@@ -11,38 +11,48 @@ import websocket
 from datetime import datetime
 
 # ==========================================
-# KONFIGURASI API & TELEGRAM
+# 1. KONFIGURASI GLOBAL (WAJIB DI ATAS)
 # ==========================================
-# Pastikan API Key diisi agar bisa akses Futures
+# Masukkan API Key & Token Telegram di sini jika tidak menggunakan environment variable
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97') 
 BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNowLNW379E6gxyM85Bvy3QzlRMtK1eMApJp6vJtpGHWdWB')
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA') 
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003896189739') 
 
 # ==========================================
-# KONFIGURASI STRATEGI
+# 2. KONFIGURASI STRATEGI
 # ==========================================
 TIMEFRAME = '1h'           # H1
-ADX_THRESHOLD = 25         
+ADX_THRESHOLD = 40         # Filter ADX > 40 (Super Strong Trend)
 LIMIT_CANDLES = 300        
 TOP_COINS_COUNT = 20       # Jumlah koin yang dipantau
 
+# ==========================================
+# 3. CLASS BOT UTAMA
+# ==========================================
 class HybridBot:
     def __init__(self):
+        # Cek apakah API Key sudah diisi
+        if not BINANCE_API_KEY or "MASUKKAN" in BINANCE_API_KEY:
+            print("⚠️ PERINGATAN: API Key belum diisi dengan benar di bagian atas file!")
+            
         # Inisialisasi REST API Client (ccxt)
-        self.exchange = ccxt.binance({
-            'apiKey': BINANCE_API_KEY,
-            'secret': BINANCE_SECRET_KEY,
-            'enableRateLimit': True,
-            'options': {'defaultType': 'future'}
-        })
-        
+        try:
+            self.exchange = ccxt.binance({
+                'apiKey': BINANCE_API_KEY,
+                'secret': BINANCE_SECRET_KEY,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'future'}
+            })
+            print(f"✅ Hybrid Bot Siap. Mode: WebSocket + REST Fallback.")
+        except Exception as e:
+            print(f"❌ Gagal inisialisasi Exchange: {e}")
+
         # Data Store Lokal (Untuk pemantauan WebSocket cepat)
         self.local_data = {} 
         self.active_symbols = []
         
-        print(f"✅ Hybrid Bot (WebSocket + REST Fallback) Siap.")
-        self.send_telegram_text(f"🚀 **Hybrid Bot Started!**\nMonitoring: WebSocket\nCharting: REST API (High Precision)")
+        self.send_telegram_text(f"🚀 **Hybrid Bot Started!**\nStrategy: ADX > {ADX_THRESHOLD} Only")
 
     # -----------------------------------------------------------
     # BAGIAN 1: FUNGSI UTILITAS & REST API (Untuk Data Bersih)
@@ -59,10 +69,7 @@ class HybridBot:
             return ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT']
 
     def fetch_rest_data(self, symbol):
-        """
-        Mengambil data bersih via REST API.
-        Digunakan saat inisialisasi DAN saat mau bikin Chart (biar akurat).
-        """
+        """Mengambil data bersih via REST API."""
         try:
             ohlcv = self.exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=LIMIT_CANDLES)
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -73,7 +80,7 @@ class HybridBot:
             return None
 
     def calculate_indicators(self, df):
-        """Menghitung Indikator Strategi (HLC3 + MA Dynamic + Pattern)"""
+        """Menghitung Indikator Strategi"""
         # HLC3
         df['hlc3'] = (df['high'] + df['low'] + df['close']) / 3
 
@@ -115,16 +122,19 @@ class HybridBot:
         return pattern
 
     # -----------------------------------------------------------
-    # BAGIAN 2: LOGIKA SINYAL & HANDLING ALERT (THREADED)
+    # BAGIAN 2: LOGIKA SINYAL
     # -----------------------------------------------------------
     def check_signal_logic(self, symbol, df):
-        """Mengecek logika entry pada dataframe lokal (WebSocket)"""
         if len(df) < 205: return
 
         last = df.iloc[-1]
         prev = df.iloc[-2]
-        pattern = self.detect_pattern(last, prev)
         
+        # FILTER: Strict ADX Threshold
+        if last['adx'] <= ADX_THRESHOLD:
+            return 
+
+        pattern = self.detect_pattern(last, prev)
         if not pattern: return 
 
         price = last['close']
@@ -134,63 +144,49 @@ class HybridBot:
         trend_up = (price > last['ma200_hlc3']) and (last['slope_ma200'] > 0)
         struct_up = price > last['ma200_low']
         mom_up = (last['ma10'] > last['ma20']) and (last['slope_ma10'] > 0)
-        adx_ok = last['adx'] > ADX_THRESHOLD
         pullback_up = last['low'] <= last['ma10']
         
-        if trend_up and struct_up and mom_up and adx_ok and pullback_up and pattern in ["PINBAR_BULLISH", "BULLISH_ENGULFING"]:
+        if trend_up and struct_up and mom_up and pullback_up and pattern in ["PINBAR_BULLISH", "BULLISH_ENGULFING"]:
             signal = "LONG 🟢"
 
         # --- LOGIKA SHORT ---
         trend_down = (price < last['ma200_hlc3']) and (last['slope_ma200'] < 0)
         struct_down = price < last['ma200_high']
         mom_down = (last['ma10'] < last['ma20']) and (last['slope_ma10'] < 0)
-        adx_ok = last['adx'] > ADX_THRESHOLD
         pullback_down = last['high'] >= last['ma10']
         
-        if trend_down and struct_down and mom_down and adx_ok and pullback_down and pattern in ["PINBAR_BEARISH", "BEARISH_ENGULFING"]:
+        if trend_down and struct_down and mom_down and pullback_down and pattern in ["PINBAR_BEARISH", "BEARISH_ENGULFING"]:
             signal = "SHORT 🔴"
 
-        # JIKA SINYAL VALID -> Panggil Thread terpisah untuk fetch REST API & Kirim Gambar
+        # JIKA SINYAL VALID
         if signal:
-            print(f"⚡ WebSocket mendeteksi potensi {signal} di {symbol}. Memverifikasi dengan REST API...")
-            # Kita jalankan di thread terpisah agar WebSocket tidak macet saat download data
+            print(f"⚡ Sinyal Terdeteksi: {symbol} | {signal} | ADX: {round(last['adx'],1)}")
             t = threading.Thread(target=self.process_verified_alert, args=(symbol, signal, pattern))
             t.start()
 
     def process_verified_alert(self, symbol, signal, pattern):
-        """
-        Fungsi ini dipanggil saat WebSocket menemukan sinyal.
-        TUGAS: Ambil data bersih via REST API -> Buat Chart -> Kirim Telegram.
-        """
         try:
-            # 1. Ambil Data Fresh via REST API (Agar Chart Akurat & Tidak Eror)
             df_fresh = self.fetch_rest_data(symbol)
-            
             if df_fresh is not None:
-                # Hitung ulang indikator di data fresh
                 df_fresh = self.calculate_indicators(df_fresh)
                 last_data = df_fresh.iloc[-1]
                 
-                # 2. Buat Gambar Chart
                 filename = f"chart_{symbol.replace('/','_')}_{int(time.time())}.png"
                 self.generate_chart(df_fresh, symbol, f"{signal} - {pattern}", filename)
                 
-                # 3. Kirim ke Telegram
                 msg = (
                     f"*{signal} SIGNAL VERIFIED*\n"
                     f"Asset: `{symbol}`\n"
                     f"Price: `{last_data['close']}`\n"
                     f"Trigger: `{pattern}`\n"
-                    f"ADX: `{round(last_data['adx'], 2)}`\n"
-                    f"Source: WebSocket Detect -> REST API Verify\n"
+                    f"ADX: `{round(last_data['adx'], 2)}` (Strong Trend)\n"
                 )
                 self.send_telegram_photo(msg, filename)
-                print(f"✅ Alert {symbol} terkirim ke Telegram.")
+                print(f"✅ Alert {symbol} sent.")
             else:
-                print(f"⚠️ Gagal fetch REST API untuk {symbol}, fallback ke data lokal tidak disarankan untuk charting.")
-                
+                print(f"⚠️ Gagal verifikasi REST API untuk {symbol}")
         except Exception as e:
-            print(f"❌ Error di process_verified_alert: {e}")
+            print(f"❌ Error Alert: {e}")
 
     def generate_chart(self, df, symbol, title, filename):
         plot_df = df.tail(60).set_index('timestamp')
@@ -206,81 +202,67 @@ class HybridBot:
                  savefig=dict(fname=filename, dpi=100, bbox_inches='tight'), volume=False, panel_ratios=(6,2))
 
     # -----------------------------------------------------------
-    # BAGIAN 3: WEBSOCKET ENGINE (Monitoring Cepat)
+    # BAGIAN 3: WEBSOCKET
     # -----------------------------------------------------------
     def on_message(self, ws, message):
         try:
             json_msg = json.loads(message)
-            # Cek event kline
             if 'e' in json_msg and json_msg['e'] == 'kline':
                 kline = json_msg['k']
-                if kline['x']: # HANYA JIKA CANDLE CLOSED
+                if kline['x']:
                     symbol_raw = json_msg['s']
-                    symbol_fmt = symbol_raw[:-4] + "/USDT" # Format ulang ke ccxt style (BTC/USDT)
+                    symbol_fmt = symbol_raw[:-4] + "/USDT"
                     
-                    # Update Dataframe Lokal (Untuk cek sinyal cepat)
                     new_row = {
                         'timestamp': pd.to_datetime(kline['t'], unit='ms'),
-                        'open': float(kline['o']),
-                        'high': float(kline['h']),
-                        'low': float(kline['l']),
-                        'close': float(kline['c']),
+                        'open': float(kline['o']), 'high': float(kline['h']),
+                        'low': float(kline['l']), 'close': float(kline['c']),
                         'volume': float(kline['v'])
                     }
                     
                     if symbol_fmt in self.local_data:
                         df = self.local_data[symbol_fmt]
                         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
-                        if len(df) > 305: df = df.iloc[1:] # Jaga memori
+                        if len(df) > 305: df = df.iloc[1:]
                         
-                        # Hitung Indikator Lokal
                         df = self.calculate_indicators(df)
                         self.local_data[symbol_fmt] = df
                         
-                        # Cek Sinyal di Data Lokal
                         self.check_signal_logic(symbol_fmt, df)
-                        print(f"💧 WS Update: {symbol_fmt} Closed at {new_row['close']}")
+                        print(f"💧 WS: {symbol_fmt} Close: {new_row['close']}")
         except Exception as e:
-            print(f"WS Parse Error: {e}")
+            print(f"WS Error: {e}")
 
     def on_error(self, ws, error):
         print(f"Websocket Error: {error}")
 
-    def on_close(self, ws, close_status_code, close_msg):
-        print("Websocket Terputus. Mencoba reconnect dalam 5 detik...")
+    def on_close(self, ws, *args):
+        print("Websocket Reconnecting...")
         time.sleep(5)
-        self.run() # Restart
+        self.run()
 
     def on_open(self, ws):
-        print("✅ WebSocket Terhubung! Melakukan subscribe stream...")
+        print("✅ WebSocket Connected. Subscribing...")
         params = []
         for symbol in self.active_symbols:
-            clean_symbol = symbol.replace('/', '').lower() # btc/usdt -> btcusdt
+            clean_symbol = symbol.replace('/', '').lower()
             params.append(f"{clean_symbol}@kline_{TIMEFRAME}")
-            
-        # Subscribe request
         ws.send(json.dumps({"method": "SUBSCRIBE", "params": params, "id": 1}))
-        print(f"📡 Memantau {len(params)} pair secara real-time.")
 
-    # -----------------------------------------------------------
-    # BAGIAN 4: EKSEKUSI UTAMA
-    # -----------------------------------------------------------
     def run(self):
-        # 1. Ambil List Koin via REST
-        print("Mengambil daftar Top Koin...")
+        print("1. Mengambil Top Coins...")
         self.active_symbols = self.get_top_volume_pairs()
         
-        # 2. Pre-load Data Historis via REST (Supaya indikator awal siap)
-        print("Mengisi buffer data awal (REST API)...")
+        print("2. Pre-load Data Historis...")
         for sym in self.active_symbols:
             df = self.fetch_rest_data(sym)
             if df is not None:
                 df = self.calculate_indicators(df)
                 self.local_data[sym] = df
-                print(f"Load Data: {sym} OK")
-            time.sleep(0.2) # Delay dikit biar gak kena limit
+                print(f"   Loaded: {sym}")
+            time.sleep(0.2)
 
-        # 3. Jalankan WebSocket (Futures)
+        print("3. Memulai WebSocket...")
         socket_url = "wss://fstream.binance.com/ws"
         ws = websocket.WebSocketApp(socket_url,
                                     on_open=self.on_open,
@@ -296,7 +278,7 @@ class HybridBot:
                 payload = {'chat_id': TELEGRAM_CHAT_ID, 'caption': message, 'parse_mode': 'Markdown'}
                 files = {'photo': img}
                 requests.post(url, data=payload, files=files)
-            os.remove(image_path) # Hapus file setelah kirim
+            os.remove(image_path)
         except Exception as e: print(f"Telegram Fail: {e}")
 
     def send_telegram_text(self, message):
@@ -311,5 +293,6 @@ if __name__ == "__main__":
         bot.run()
     except KeyboardInterrupt:
         print("Bot Stopped.")
+
 
 
