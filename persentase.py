@@ -18,6 +18,9 @@ client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 # Format: { 'BTCUSDT': {'prev_pct': 0.0, 'signal_sent': False} }
 coin_data = {}
 
+# Variabel Watchdog untuk mendeteksi WebSocket yang freeze
+last_msg_time = time.time()
+
 def send_telegram(message):
     """Mengirim pesan ke Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -67,7 +70,16 @@ def init_all_coins(symbols):
 
 def socket_callback(msg):
     """Handler data Real-Time dari WebSocket."""
+    global last_msg_time
+    # Update waktu pesan terakhir untuk mencegah trigger Watchdog
+    last_msg_time = time.time()
+    
     try:
+        # Tangani pesan error bawaan dari WebSocket Binance
+        if isinstance(msg, dict) and msg.get('e') == 'error':
+            print(f"[!] WebSocket Error API: {msg.get('m')}")
+            return
+
         if 'data' not in msg: return
         d = msg['data']
         symbol = d['s']
@@ -128,7 +140,7 @@ def run_fast_scanner():
         symbols = [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
     except Exception as e:
         print(f"[!] Gagal mengambil market: {e}")
-        return
+        return None
 
     # Inisialisasi data historis (1 menit ke belakang)
     init_all_coins(symbols)
@@ -146,11 +158,38 @@ def run_fast_scanner():
         time.sleep(1)
 
     print(f"[*] {len(streams)} Streams WebSocket Aktif! Memantau lonjakan harga...")
+    return twm
 
 if __name__ == "__main__":
-    try:
-        run_fast_scanner()
-        while True:
+    while True:
+        try:
+            # Reset Watchdog timer saat mulai
+            last_msg_time = time.time()
+            twm = run_fast_scanner()
+            
+            if twm is None:
+                print("[!] Gagal memulai scanner. Mencoba lagi dalam 30 detik...")
+                time.sleep(30)
+                continue
+
+            # Watchdog Loop
+            while True:
+                time.sleep(10)
+                # Jika tidak ada pesan sama sekali dari server Binance selama 60 detik,
+                # berarti koneksi freeze / closed (Read loop has been closed).
+                if time.time() - last_msg_time > 60:
+                    print("\n[!] PERINGATAN: Tidak ada aliran data selama 60 detik.")
+                    print("[!] Koneksi WebSocket terputus (Read loop closed).")
+                    print("[*] Merestart bot secara otomatis...\n")
+                    twm.stop()
+                    time.sleep(5)
+                    break # Keluar dari inner loop untuk melakukan restart dari awal
+                    
+        except KeyboardInterrupt:
+            print("\n[!] Bot dihentikan secara manual.")
+            if 'twm' in locals() and twm:
+                twm.stop()
+            break
+        except Exception as e:
+            print(f"[!] Terjadi Error Kritis: {e}")
             time.sleep(10)
-    except KeyboardInterrupt:
-        print("\n[!] Bot dihentikan.")
