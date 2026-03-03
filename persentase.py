@@ -18,14 +18,12 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003812500986')
 
 # --- SETTING ---
 TIMEFRAMES = {
-    '15m': Client.KLINE_INTERVAL_15MINUTE,
-    '1h': Client.KLINE_INTERVAL_1HOUR,
     '4h': Client.KLINE_INTERVAL_4HOUR
 }
 DB_FILE = 'bot_memory.json'
 
 # --- SISTEM MEMORI ---
-# Struktur Memori: { '15m': { 'BTCUSDT': [{'open':.., 'close':.., 'close_time':..}] }, ... }
+# Struktur Memori: { '4h': { 'BTCUSDT': [{'open':.., 'close':.., 'close_time':..}] }, ... }
 analysis_data = {tf: {} for tf in TIMEFRAMES.keys()}
 client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 ws_needs_restart = False
@@ -254,7 +252,7 @@ def scan_historical_signals_1_day(symbols):
     """Mencari sinyal TERBARU dari 1 hari ke belakang (Hanya 1 sinyal per Timeframe)."""
     print("[*] Memulai pemindaian data historis 1 hari ke belakang dan Pre-fill Memori...")
     # Batas disesuaikan untuk 1 hari (24 jam)
-    limit_map = {'15m': 96, '1h': 24, '4h': 6}
+    limit_map = {'4h': 6}
     
     for tf_key, interval in TIMEFRAMES.items():
         print(f"[*] Memindai Timeframe {tf_key}...")
