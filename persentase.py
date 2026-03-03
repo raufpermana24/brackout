@@ -138,6 +138,7 @@ def send_telegram(message, symbol=None, tf_key=None):
 def get_historical_data(symbol, tf_key):
     """Fungsi Fallback: Mengambil data via REST API."""
     try:
+        time.sleep(0.2) # Jeda agar tidak terkena limit saat dipanggil beruntun oleh banyak koin
         interval = TIMEFRAMES[tf_key]
         klines = client.futures_klines(symbol=symbol, interval=interval, limit=6)
         if len(klines) < 6: return None
@@ -235,6 +236,7 @@ def socket_callback(msg):
             }
             
             if symbol not in analysis_data[tf_key]:
+                print(f"[*] Fallback REST API Triggered for {symbol} {tf_key}...")
                 hist_candles = get_historical_data(symbol, tf_key)
                 if hist_candles:
                     analysis_data[tf_key][symbol] = hist_candles
@@ -250,12 +252,12 @@ def socket_callback(msg):
 
 def scan_historical_signals_1_day(symbols):
     """Mencari sinyal TERBARU dari 1 hari ke belakang (Hanya 1 sinyal per Timeframe)."""
-    print("[*] Memulai pemindaian data historis 1 hari ke belakang...")
+    print("[*] Memulai pemindaian data historis 1 hari ke belakang dan Pre-fill Memori...")
     # Batas disesuaikan untuk 1 hari (24 jam)
     limit_map = {'15m': 96, '1h': 24, '4h': 6}
     
     for tf_key, interval in TIMEFRAMES.items():
-        print(f"[*] Mencari histori 1 sinyal paling baru untuk Timeframe {tf_key}...")
+        print(f"[*] Memindai Timeframe {tf_key}...")
         latest_signal = None
         
         for symbol in symbols:
@@ -263,6 +265,19 @@ def scan_historical_signals_1_day(symbols):
                 limit = limit_map[tf_key]
                 klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
                 
+                # --- PRE-FILL MEMORY ---
+                # Mengisi memori bot langsung dari proses historis untuk menghindari 
+                # spam "get_historical_data" (REST API) saat websocket berjalan.
+                if len(klines) >= 6:
+                    analysis_data[tf_key][symbol] = [
+                        {
+                            'open_time': k[0], 
+                            'close_time': k[6], 
+                            'open': float(k[1]), 
+                            'close': float(k[4])
+                        } for k in klines[-6:]
+                    ]
+
                 if len(klines) < 3: continue
                 
                 # Cari dari yang terbaru (mundur) ke yang paling tua
@@ -291,9 +306,9 @@ def scan_historical_signals_1_day(symbols):
                             }
                         break # Karena kita mencari dari belakang, ini pasti yang paling baru untuk koin INI. Lanjut ke koin lain.
                         
-                time.sleep(0.05)
+                time.sleep(0.1) # JEDA DITAMBAH (0.1 detik) agar aman dari Banned IP (-1003)
             except Exception as e:
-                pass
+                time.sleep(1) # Jika gagal, diam sebentar sebelum lanjut
                 
         # --- KIRIM HANYA 1 SINYAL TERBARU UNTUK TIMEFRAME INI ---
         if latest_signal:
@@ -321,7 +336,7 @@ def scan_historical_signals_1_day(symbols):
             save_memory()
             time.sleep(1) 
             
-    print("[*] ✅ Pemindaian data historis 1 hari telah selesai.")
+    print("[*] ✅ Pemindaian data historis 1 hari dan Pre-fill Memori telah selesai.")
 
 def start_websocket(streams):
     """Membuka dan memulai ThreadedWebsocketManager dengan metode Chunking untuk menghindari HTTP 414."""
