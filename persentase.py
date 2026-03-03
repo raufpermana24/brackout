@@ -324,9 +324,17 @@ def scan_historical_signals_1_day(symbols):
     print("[*] ✅ Pemindaian data historis 1 hari telah selesai.")
 
 def start_websocket(streams):
+    """Membuka dan memulai ThreadedWebsocketManager dengan metode Chunking untuk menghindari HTTP 414."""
     twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_SECRET_KEY)
     twm.start()
-    twm.start_multiplex_socket(callback=socket_callback, streams=streams)
+    
+    # Chunking: Pecah daftar streams agar tidak kepanjangan (maks 150 stream per socket)
+    chunk_size = 150
+    for i in range(0, len(streams), chunk_size):
+        chunk = streams[i:i + chunk_size]
+        twm.start_multiplex_socket(callback=socket_callback, streams=chunk)
+        time.sleep(0.5) # Berikan jeda antar pembuatan socket
+        
     return twm
 
 def run_scanner():
