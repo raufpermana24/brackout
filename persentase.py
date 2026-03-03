@@ -196,7 +196,8 @@ def check_signal(symbol, tf_key, candles):
             f"1️⃣ *Hijau 1:* `+{pct1:.2f}%`\n"
             f"2️⃣ *Hijau 2:* `+{pct2:.2f}%`\n"
             f"3️⃣ *Hijau 3:* `+{pct3:.2f}%`\n\n"
-            f"💰 *Last Price:* `{c3['close']}`\n"
+            f"💰 *Last Price:* `{c3['close']}`\n\n"
+            f"🎨 *Ket. Garis EMA:* 🔴5 🟠8 🟡13 🟢21 🔵34 🟣55 🟪89 💖144 🩵233\n"
             f"🔗 [Binance Chart](https://www.binance.com/en/futures/{symbol})"
         )
         send_telegram(msg, symbol, tf_key)
@@ -248,70 +249,78 @@ def socket_callback(msg):
         pass
 
 def scan_historical_signals_1_day(symbols):
-    """Mencari sinyal dari 1 hari ke belakang dengan filter database."""
+    """Mencari sinyal TERBARU dari 1 hari ke belakang (Hanya 1 sinyal per Timeframe)."""
     print("[*] Memulai pemindaian data historis 1 hari ke belakang...")
     # Batas disesuaikan untuk 1 hari (24 jam)
     limit_map = {'15m': 96, '1h': 24, '4h': 6}
     
-    for symbol in symbols:
-        for tf_key, interval in TIMEFRAMES.items():
+    for tf_key, interval in TIMEFRAMES.items():
+        print(f"[*] Mencari histori 1 sinyal paling baru untuk Timeframe {tf_key}...")
+        latest_signal = None
+        
+        for symbol in symbols:
             try:
                 limit = limit_map[tf_key]
                 klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
                 
                 if len(klines) < 3: continue
                 
-                is_active_streak = False
-                
-                for i in range(2, len(klines) - 1): 
+                # Cari dari yang terbaru (mundur) ke yang paling tua
+                for i in range(len(klines) - 2, 1, -1): 
                     c1_open, c1_close = float(klines[i-2][1]), float(klines[i-2][4])
                     c2_open, c2_close = float(klines[i-1][1]), float(klines[i-1][4])
                     c3_open, c3_close = float(klines[i][1]), float(klines[i][4])
                     c3_close_time = klines[i][6]
                     
-                    if c3_close <= c3_open:
-                        is_active_streak = False # Reset streak jika candle merah
-                        
                     if c1_close > c1_open and c2_close > c2_open and c3_close > c3_open:
-                        if is_active_streak: continue # Lewati jika masih di streak yang sama
-                        
+                        # Cek database apakah ini sudah pernah dikirim sebelumnya
                         last_time = last_signal_time[tf_key].get(symbol, 0)
                         if c3_close_time <= last_time:
-                            is_active_streak = True
-                            continue # Lewati jika sudah ada di database lokal
+                            break # Lewati jika sudah ada di database lokal
                             
-                        # Hitung dan Kirim
-                        total_pct = ((c3_close - c1_open) / c1_open) * 100
-                        pct1 = ((c1_close - c1_open) / c1_open) * 100
-                        pct2 = ((c2_close - c2_open) / c2_open) * 100
-                        pct3 = ((c3_close - c3_open) / c3_open) * 100
-                        close_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(c3_close_time / 1000))
-                        
-                        print(f"🕰️ HISTORICAL SIGNAL [{tf_key}] {symbol} at {close_time}")
-                        msg = (
-                            f"🕰️ *HISTORICAL SIGNAL (Past 1 Day)*\n\n"
-                            f"💎 *Symbol:* #{symbol}\n"
-                            f"⏱️ *Timeframe:* {tf_key}\n"
-                            f"📅 *Waktu Close:* {close_time}\n"
-                            f"📈 *Total Kenaikan:* `+{total_pct:.2f}%`\n\n"
-                            f"1️⃣ *Hijau 1:* `+{pct1:.2f}%`\n"
-                            f"2️⃣ *Hijau 2:* `+{pct2:.2f}%`\n"
-                            f"3️⃣ *Hijau 3:* `+{pct3:.2f}%`\n\n"
-                            f"💰 *Price (Then):* `{c3_close}`\n"
-                            f"🔗 [Binance Chart](https://www.binance.com/en/futures/{symbol})"
-                        )
-                        send_telegram(msg, symbol, tf_key)
-                        
-                        # Simpan ke memori dan JSON
-                        last_signal_time[tf_key][symbol] = c3_close_time
-                        is_active_streak = True
-                        save_memory()
-                        time.sleep(1) 
+                        # Update jika sinyal ini LEBIH BARU daripada sinyal koin lain yang sudah ditemukan di loop
+                        if latest_signal is None or c3_close_time > latest_signal['time']:
+                            latest_signal = {
+                                'symbol': symbol,
+                                'time': c3_close_time,
+                                'c3_close': c3_close,
+                                'total_pct': ((c3_close - c1_open) / c1_open) * 100,
+                                'pct1': ((c1_close - c1_open) / c1_open) * 100,
+                                'pct2': ((c2_close - c2_open) / c2_open) * 100,
+                                'pct3': ((c3_close - c3_open) / c3_open) * 100
+                            }
+                        break # Karena kita mencari dari belakang, ini pasti yang paling baru untuk koin INI. Lanjut ke koin lain.
                         
                 time.sleep(0.05)
             except Exception as e:
                 pass
                 
+        # --- KIRIM HANYA 1 SINYAL TERBARU UNTUK TIMEFRAME INI ---
+        if latest_signal:
+            sym = latest_signal['symbol']
+            close_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(latest_signal['time'] / 1000))
+            
+            print(f"🕰️ HISTORICAL SIGNAL [{tf_key}] {sym} at {close_time}")
+            msg = (
+                f"🕰️ *HISTORICAL SIGNAL (Terbaru di {tf_key})*\n\n"
+                f"💎 *Symbol:* #{sym}\n"
+                f"⏱️ *Timeframe:* {tf_key}\n"
+                f"📅 *Waktu Close:* {close_time}\n"
+                f"📈 *Total Kenaikan:* `+{latest_signal['total_pct']:.2f}%`\n\n"
+                f"1️⃣ *Hijau 1:* `+{latest_signal['pct1']:.2f}%`\n"
+                f"2️⃣ *Hijau 2:* `+{latest_signal['pct2']:.2f}%`\n"
+                f"3️⃣ *Hijau 3:* `+{latest_signal['pct3']:.2f}%`\n\n"
+                f"💰 *Price (Then):* `{latest_signal['c3_close']}`\n\n"
+                f"🎨 *Ket. Garis EMA:* 🔴5 🟠8 🟡13 🟢21 🔵34 🟣55 🟪89 💖144 🩵233\n"
+                f"🔗 [Binance Chart](https://www.binance.com/en/futures/{sym})"
+            )
+            send_telegram(msg, sym, tf_key)
+            
+            # Simpan ke memori dan JSON agar tidak dikirim lagi nanti
+            last_signal_time[tf_key][sym] = latest_signal['time']
+            save_memory()
+            time.sleep(1) 
+            
     print("[*] ✅ Pemindaian data historis 1 hari telah selesai.")
 
 def start_websocket(streams):
