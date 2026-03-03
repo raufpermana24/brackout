@@ -2,6 +2,10 @@ import os
 import time
 import requests
 import threading
+import io
+import numpy as np
+import pandas as pd
+import mplfinance as mpf
 from binance.client import Client
 from binance import ThreadedWebsocketManager
 
@@ -11,185 +15,310 @@ BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNow
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003812500986')
 
-# --- INISIALISASI ---
+# --- SETTING ---
+TIMEFRAMES = {
+    '15m': Client.KLINE_INTERVAL_15MINUTE,
+    '1h': Client.KLINE_INTERVAL_1HOUR,
+    '4h': Client.KLINE_INTERVAL_4HOUR
+}
+
+# Struktur Memori: { '15m': { 'BTCUSDT': [c1_change, c2_change] }, ... }
+analysis_data = {tf: {} for tf in TIMEFRAMES.keys()}
 client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 
-# Struktur Memori Internal
-# Format: { 'BTCUSDT': {'prev_pct': 0.0, 'signal_sent': False} }
-coin_data = {}
+# Flag indikator untuk reconnect websocket
+ws_needs_restart = False
 
-# Variabel Watchdog untuk mendeteksi WebSocket yang freeze
-last_msg_time = time.time()
-
-def send_telegram(message):
-    """Mengirim pesan ke Telegram."""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
+def get_chart_image(symbol, tf_key):
+    """Mengambil data historis dan menggambar chart Candlestick beserta Indikator."""
     try:
+        interval = TIMEFRAMES[tf_key]
+        # Ambil 60 candle terakhir untuk digambar
+        klines = client.futures_klines(symbol=symbol, interval=interval, limit=60)
+        
+        # Format ke Pandas DataFrame
+        df = pd.DataFrame(klines, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'c_time', 'q_av', 'trades', 'tb_base', 'tb_quote', 'ignore'])
+        df['Date'] = pd.to_datetime(df['Date'], unit='ms')
+        df.set_index('Date', inplace=True)
+        
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+            df[col] = df[col].astype(float)
+            
+        # --- PERHITUNGAN INDIKATOR ---
+        # 1. Hitung RSI (14) menggunakan Exponential Moving Average (Wilder's Method)
+        delta = df['Close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -1 * delta.clip(upper=0)
+        ema_gain = gain.ewm(com=13, adjust=False).mean()
+        ema_loss = loss.ewm(com=13, adjust=False).mean()
+        rs = ema_gain / ema_loss
+        df['RSI'] = 100 - (100 / (1 + rs))
+
+        # 2. Hitung OBV (On-Balance Volume)
+        # Jika harga naik, volume ditambah. Jika turun, volume dikurang.
+        df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+
+        # Buat buffer gambar di memori
+        buf = io.BytesIO()
+        
+        # Konfigurasi gaya grafik mplfinance
+        mc = mpf.make_marketcolors(up='g', down='r', edge='inherit', wick='inherit', volume='in')
+        s  = mpf.make_mpf_style(marketcolors=mc, gridstyle=':')
+        
+        # Tambahkan indikator RSI dan OBV sebagai panel tambahan (subplots) di bawah chart utama
+        apdict = [
+            mpf.make_addplot(df['RSI'], panel=1, color='blue', ylabel='RSI (14)'),
+            # Tambahkan garis putus-putus untuk batas Overbought (70) dan Oversold (30)
+            mpf.make_addplot([70]*len(df), panel=1, color='red', linestyle='dashed', alpha=0.5), 
+            mpf.make_addplot([30]*len(df), panel=1, color='green', linestyle='dashed', alpha=0.5),
+            
+            mpf.make_addplot(df['OBV'], panel=2, color='orange', ylabel='OBV')
+        ]
+        
+        # Gambar grafik dan simpan ke buffer
+        # panel_ratios=(4, 1, 1) berarti: Chart utama lebih besar, sementara RSI dan OBV di bawahnya lebih kecil
+        mpf.plot(
+            df, type='candle', style=s, title=f"{symbol} | {tf_key}", 
+            savefig=buf, figsize=(10, 8), addplot=apdict, panel_ratios=(4, 1, 1)
+        )
+        buf.seek(0)
+        
+        return buf
+    except Exception as e:
+        print(f"[!] Gagal membuat chart untuk {symbol}: {e}")
+        return None
+
+def send_telegram(message, symbol=None, tf_key=None):
+    """Mengirim pesan (dan gambar jika tersedia) ke Telegram."""
+    try:
+        # Jika ada symbol dan tf_key, coba buat dan kirim foto grafik
+        if symbol and tf_key:
+            photo_buf = get_chart_image(symbol, tf_key)
+            if photo_buf:
+                url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+                payload = {"chat_id": TELEGRAM_CHAT_ID, "caption": message, "parse_mode": "Markdown"}
+                files = {"photo": (f"{symbol}_chart.png", photo_buf, "image/png")}
+                
+                requests.post(url, data=payload, files=files, timeout=15)
+                return # Sukses kirim gambar, keluar fungsi
+                
+        # Fallback: Jika gagal buat chart atau data tidak lengkap, kirim teks saja
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
         print(f"[!] Error Telegram: {e}")
 
-def init_historical_data(symbol):
-    """Mengambil data 1 candle terakhir (1m) agar bot bisa langsung bekerja."""
+def get_historical_data(symbol, tf_key):
+    """Fungsi Fallback: Mengambil data via REST API jika WebSocket belum mencukupi."""
     try:
-        # Ambil 2 candle terakhir (1 close, 1 running)
-        klines = client.futures_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=2)
-        if len(klines) >= 2:
-            c1_open, c1_close = float(klines[0][1]), float(klines[0][4])
-            c1_pct = ((c1_close - c1_open) / c1_open) * 100
-            
-            coin_data[symbol] = {
-                'prev_pct': c1_pct,
-                'signal_sent': False
-            }
-            return True
-    except Exception:
-        pass
-    return False
+        interval = TIMEFRAMES[tf_key]
+        # Ambil 6 candle terakhir sesuai permintaan
+        klines = client.futures_klines(symbol=symbol, interval=interval, limit=6)
+        if len(klines) < 6: return None
+        
+        candles = []
+        for k in klines:
+            # k[1] adalah Open, k[4] adalah Close
+            candles.append({'open': float(k[1]), 'close': float(k[4])})
+        
+        return candles
+    except Exception as e:
+        return None
 
-def init_all_coins(symbols):
-    """Fungsi untuk inisialisasi awal semua koin menggunakan Threading agar cepat."""
-    print(f"[*] Mengunduh data awal untuk {len(symbols)} koin. Mohon tunggu...")
-    threads = []
+def check_signal(symbol, tf_key, candles):
+    """Logika utama: 3 Candle Terakhir Harus Hijau"""
+    if len(candles) < 3: return
     
-    def worker(sym):
-        if not init_historical_data(sym):
-            # Jika gagal, buat default memori
-            coin_data[sym] = {'prev_pct': 0.0, 'signal_sent': False}
-
-    for sym in symbols:
-        t = threading.Thread(target=worker, args=(sym,))
-        threads.append(t)
-        t.start()
+    # Ambil 3 candle terakhir yang sudah close dari memori (maks 6 candle)
+    c1 = candles[-3]
+    c2 = candles[-2]
+    c3 = candles[-1]
+    
+    # Cek apakah ketiganya hijau (Close > Open)
+    if c1['close'] > c1['open'] and c2['close'] > c2['open'] and c3['close'] > c3['open']:
+        # Hitung total persentase kenaikan dari Open C1 ke Close C3
+        total_pct = ((c3['close'] - c1['open']) / c1['open']) * 100
         
-    for t in threads:
-        t.join()
+        # Hitung kenaikan per candle untuk informasi di Telegram
+        pct1 = ((c1['close'] - c1['open']) / c1['open']) * 100
+        pct2 = ((c2['close'] - c2['open']) / c2['open']) * 100
+        pct3 = ((c3['close'] - c3['open']) / c3['open']) * 100
         
-    print("[√] Inisialisasi data selesai. Bot siap memindai secara real-time!")
+        print(f"🚀 SIGNAL [{tf_key}] {symbol}: 3 GREEN CANDLES (+{total_pct:.2f}%)")
+        msg = (
+            f"🚀 *3 GREEN CANDLES DETECTED: {symbol}*\n\n"
+            f"⏱️ *Timeframe:* {tf_key}\n"
+            f"📈 *Total Kenaikan:* `+{total_pct:.2f}%`\n\n"
+            f"1️⃣ *Hijau 1:* `+{pct1:.2f}%`\n"
+            f"2️⃣ *Hijau 2:* `+{pct2:.2f}%`\n"
+            f"3️⃣ *Hijau 3:* `+{pct3:.2f}%`\n\n"
+            f"💰 *Last Price:* `{c3['close']}`\n"
+            f"🔗 [Binance Chart](https://www.binance.com/en/futures/{symbol})"
+        )
+        # Panggil send_telegram dengan info koin untuk digenerate gambarnya
+        send_telegram(msg, symbol, tf_key)
 
 def socket_callback(msg):
-    """Handler data Real-Time dari WebSocket."""
-    global last_msg_time
-    # Update waktu pesan terakhir untuk mencegah trigger Watchdog
-    last_msg_time = time.time()
-    
+    """Handler data dari WebSocket."""
+    global ws_needs_restart
     try:
-        # Tangani pesan error bawaan dari WebSocket Binance
+        # Menangkap error putus koneksi "Read loop has been closed..."
         if isinstance(msg, dict) and msg.get('e') == 'error':
-            print(f"[!] WebSocket Error API: {msg.get('m')}")
+            print(f"\n[!] WebSocket Terputus/Error Terdeteksi: {msg.get('m')}")
+            ws_needs_restart = True
             return
 
         if 'data' not in msg: return
         d = msg['data']
         symbol = d['s']
         candle = d['k']
-        
+        tf_code = candle['i']
         is_closed = candle['x']
-        c_open = float(candle['o'])
-        c_curr = float(candle['c'])
         
-        # Hitung persentase candle yang sedang berjalan SAAT INI (Detik ini)
-        curr_pct = ((c_curr - c_open) / c_open) * 100
-        
-        if symbol not in coin_data:
-            return
+        tf_key = next((k for k, v in TIMEFRAMES.items() if v == tf_code), None)
+        if not tf_key: return
 
-        prev_pct = coin_data[symbol]['prev_pct']
-        signal_sent = coin_data[symbol]['signal_sent']
-
-        # ==========================================================
-        # LOGIKA FAST SCANNER (REAL-TIME TRIGGER)
-        # Jika Candle 1 > 1% DAN Candle 2 menyentuh > 2% SAAT INI
-        # ==========================================================
-        if prev_pct > 1.0 and curr_pct > 2.0 and not signal_sent:
-            print(f"⚡ INSTANT SIGNAL: {symbol} | Prev: {prev_pct:.2f}% | Now: {curr_pct:.2f}%")
-            
-            alert_msg = (
-                f"⚡ *FAST SCALPING SIGNAL* ⚡\n\n"
-                f"💰 *Koin:* #{symbol}\n"
-                f"⏱️ *Timeframe:* 1 Menit (1m)\n"
-                f"🟢 *Candle Sebelumnya:* `+{prev_pct:.2f}%`\n"
-                f"🚀 *Candle Berjalan:* `+{curr_pct:.2f}%` (Real-Time)\n"
-                f"💵 *Harga Breakout:* `{c_curr}`\n\n"
-                f"⚠️ _Sinyal instan. Harga sedang melesat naik!_"
-            )
-            send_telegram(alert_msg)
-            
-            # Kunci sinyal agar tidak spam berkali-kali di candle yang sama
-            coin_data[symbol]['signal_sent'] = True
-
-        # Jika candle 1 menit ini sudah tertutup, simpan datanya untuk candle berikutnya
         if is_closed:
-            coin_data[symbol]['prev_pct'] = curr_pct
-            # Reset pengunci sinyal untuk candle menit berikutnya
-            coin_data[symbol]['signal_sent'] = False
-
+            open_p = float(candle['o'])
+            close_p = float(candle['c'])
+            new_candle = {'open': open_p, 'close': close_p}
+            
+            if symbol not in analysis_data[tf_key]:
+                print(f"[*] Initializing {symbol} {tf_key} via REST API...")
+                hist_candles = get_historical_data(symbol, tf_key)
+                if hist_candles:
+                    analysis_data[tf_key][symbol] = hist_candles
+                    check_signal(symbol, tf_key, analysis_data[tf_key][symbol])
+            else:
+                analysis_data[tf_key][symbol].append(new_candle)
+                # Jaga agar memori tidak bengkak, batasi hanya 6 candle terakhir
+                if len(analysis_data[tf_key][symbol]) > 6:
+                    analysis_data[tf_key][symbol] = analysis_data[tf_key][symbol][-6:]
+                
+                check_signal(symbol, tf_key, analysis_data[tf_key][symbol])
     except Exception as e:
         pass
 
-def run_fast_scanner():
-    print("==============================================")
-    print("   🚀 BINANCE ULTRA-FAST MOMENTUM SCANNER")
-    print("   [Mode: 1 Menit & Real-Time Trigger]")
-    print("==============================================")
+# --- FUNGSI TAMBAHAN: SCAN HISTORICAL 2 HARI ---
+def scan_historical_signals_2_days(symbols):
+    """Mencari sinyal dari 2 hari ke belakang dan mengirimkannya."""
+    print("[*] Memulai pemindaian data historis 2 hari ke belakang...")
     
-    # Ambil semua simbol futures yang aktif
+    limit_map = {
+        '15m': 48 * 4,
+        '1h': 48,
+        '4h': 12
+    }
+    
+    for symbol in symbols:
+        for tf_key, interval in TIMEFRAMES.items():
+            try:
+                limit = limit_map[tf_key]
+                klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+                
+                if len(klines) < 3:
+                    continue
+                    
+                for i in range(2, len(klines) - 1): # Butuh 3 candle (i-2, i-1, i)
+                    c1_open = float(klines[i-2][1])
+                    c1_close = float(klines[i-2][4])
+                    
+                    c2_open = float(klines[i-1][1])
+                    c2_close = float(klines[i-1][4])
+                    
+                    c3_open = float(klines[i][1])
+                    c3_close = float(klines[i][4])
+                    
+                    # Syarat mutlak: Ketiga candle harus hijau
+                    if c1_close > c1_open and c2_close > c2_open and c3_close > c3_open:
+                        total_pct = ((c3_close - c1_open) / c1_open) * 100
+                        pct1 = ((c1_close - c1_open) / c1_open) * 100
+                        pct2 = ((c2_close - c2_open) / c2_open) * 100
+                        pct3 = ((c3_close - c3_open) / c3_open) * 100
+                        
+                        close_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(klines[i][6] / 1000))
+                        price = c3_close
+                        
+                        print(f"🕰️ HISTORICAL SIGNAL [{tf_key}] {symbol} at {close_time}")
+                        msg = (
+                            f"🕰️ *HISTORICAL SIGNAL (Past 2 Days)*\n\n"
+                            f"💎 *Symbol:* #{symbol}\n"
+                            f"⏱️ *Timeframe:* {tf_key}\n"
+                            f"📅 *Waktu Close:* {close_time}\n"
+                            f"📈 *Total Kenaikan:* `+{total_pct:.2f}%`\n\n"
+                            f"1️⃣ *Hijau 1:* `+{pct1:.2f}%`\n"
+                            f"2️⃣ *Hijau 2:* `+{pct2:.2f}%`\n"
+                            f"3️⃣ *Hijau 3:* `+{pct3:.2f}%`\n\n"
+                            f"💰 *Price (Then):* `{price}`\n"
+                            f"🔗 [Binance Chart](https://www.binance.com/en/futures/{symbol})"
+                        )
+                        # Panggil send_telegram dengan parameter koin untuk generate gambar
+                        send_telegram(msg, symbol, tf_key)
+                        time.sleep(1) # Jeda agar tidak spam saat mengirim banyak foto historis
+                        
+                time.sleep(0.05)
+            except Exception as e:
+                pass
+                
+    print("[*] ✅ Pemindaian data historis 2 hari telah selesai.")
+
+def start_websocket(streams):
+    """Membuka dan memulai ThreadedWebsocketManager."""
+    twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_SECRET_KEY)
+    twm.start()
+    twm.start_multiplex_socket(callback=socket_callback, streams=streams)
+    return twm
+
+def run_scanner():
+    global ws_needs_restart
+    print("=== BINANCE HYBRID MULTI-TF SCANNER STARTED ===")
+    print(f"Monitoring: {list(TIMEFRAMES.keys())}")
+    
     try:
         info = client.futures_exchange_info()
         symbols = [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
+        print(f"[*] Scanning {len(symbols)} market koin...")
     except Exception as e:
-        print(f"[!] Gagal mengambil market: {e}")
-        return None
+        print(f"[!] Gagal ambil daftar simbol: {e}")
+        return
 
-    # Inisialisasi data historis (1 menit ke belakang)
-    init_all_coins(symbols)
+    # Mulai pemindaian history di background thread
+    threading.Thread(target=scan_historical_signals_2_days, args=(symbols,), daemon=True).start()
 
-    # Siapkan koneksi WebSocket (1 menit TF)
-    streams = [f"{s.lower()}@kline_1m" for s in symbols]
-    twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_SECRET_KEY)
-    twm.start()
+    # Siapkan daftar stream untuk websocket
+    streams = []
+    for s in symbols:
+        for tf in TIMEFRAMES.values():
+            streams.append(f"{s.lower()}@kline_{tf}")
+    
+    # Inisialisasi awal WebSocket
+    twm = start_websocket(streams)
 
-    # Pecah stream menjadi chunk berisi 200 (Batas Binance)
-    chunk_size = 200
-    for i in range(0, len(streams), chunk_size):
-        chunk = streams[i:i + chunk_size]
-        twm.start_futures_multiplex_socket(callback=socket_callback, streams=chunk)
-        time.sleep(1)
-
-    print(f"[*] {len(streams)} Streams WebSocket Aktif! Memantau lonjakan harga...")
-    return twm
+    # Loop utama bot dan penjaga kestabilan WebSocket
+    try:
+        while True:
+            if ws_needs_restart:
+                print("[*] Melakukan Reset pada koneksi WebSocket...")
+                try:
+                    twm.stop() # Hentikan socket lama
+                except:
+                    pass
+                
+                time.sleep(5) # Beri jeda 5 detik agar port benar-benar tertutup bersih
+                
+                # Memulai ulang koneksi websocket
+                twm = start_websocket(streams)
+                ws_needs_restart = False
+                print("[*] ✅ WebSocket berhasil disambung ulang dan berjalan kembali!")
+                
+            time.sleep(5)
+    except KeyboardInterrupt:
+        print("\n[!] Bot stopped secara manual.")
+        try:
+            twm.stop()
+        except:
+            pass
 
 if __name__ == "__main__":
-    while True:
-        try:
-            # Reset Watchdog timer saat mulai
-            last_msg_time = time.time()
-            twm = run_fast_scanner()
-            
-            if twm is None:
-                print("[!] Gagal memulai scanner. Mencoba lagi dalam 30 detik...")
-                time.sleep(30)
-                continue
-
-            # Watchdog Loop
-            while True:
-                time.sleep(10)
-                # Jika tidak ada pesan sama sekali dari server Binance selama 60 detik,
-                # berarti koneksi freeze / closed (Read loop has been closed).
-                if time.time() - last_msg_time > 60:
-                    print("\n[!] PERINGATAN: Tidak ada aliran data selama 60 detik.")
-                    print("[!] Koneksi WebSocket terputus (Read loop closed).")
-                    print("[*] Merestart bot secara otomatis...\n")
-                    twm.stop()
-                    time.sleep(5)
-                    break # Keluar dari inner loop untuk melakukan restart dari awal
-                    
-        except KeyboardInterrupt:
-            print("\n[!] Bot dihentikan secara manual.")
-            if 'twm' in locals() and twm:
-                twm.stop()
-            break
-        except Exception as e:
-            print(f"[!] Terjadi Error Kritis: {e}")
-            time.sleep(10)
+    run_scanner()
