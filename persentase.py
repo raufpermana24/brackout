@@ -3,8 +3,7 @@ import time
 import requests
 import threading
 from binance.client import Client
-from binance import BinanceSocketManager
-from twisted.internet import reactor
+from binance import ThreadedWebsocketManager
 
 # --- KONFIGURASI KREDENSIAL ---
 BINANCE_API_KEY = os.environ.get('BINANCE_API_KEY', 'fZwDMOfBL6rDU9jfUQox64fUAb2RSN48myxMPUGDAINYjmLdqJmUFhVRWLqlsX97')
@@ -12,18 +11,15 @@ BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNow
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9QMgQpVqnd5f1KgEsKA')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003812500986')
 
-# --- SETTING ---
-TIMEFRAMES = {
-    '15m': Client.KLINE_INTERVAL_15MINUTE,
-    '1h': Client.KLINE_INTERVAL_1HOUR,
-    '4h': Client.KLINE_INTERVAL_4HOUR
-}
-
-# Struktur Memori: { '15m': { 'BTCUSDT': [c1_change, c2_change] }, ... }
-analysis_data = {tf: {} for tf in TIMEFRAMES.keys()}
+# --- INISIALISASI ---
 client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 
+# Struktur Memori Internal
+# Format: { 'BTCUSDT': {'prev_pct': 0.0, 'signal_sent': False} }
+coin_data = {}
+
 def send_telegram(message):
+    """Mengirim pesan ke Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
@@ -31,167 +27,130 @@ def send_telegram(message):
     except Exception as e:
         print(f"[!] Error Telegram: {e}")
 
-def get_historical_data(symbol, tf_key):
-    """Fungsi Fallback: Mengambil data via REST API jika WebSocket belum mencukupi."""
+def init_historical_data(symbol):
+    """Mengambil data 1 candle terakhir (1m) agar bot bisa langsung bekerja."""
     try:
-        interval = TIMEFRAMES[tf_key]
-        # Ambil 3 candle (2 yang sudah close, 1 yang sedang berjalan)
-        klines = client.futures_klines(symbol=symbol, interval=interval, limit=3)
-        if len(klines) < 3: return None
-        
-        # Hitung candle yang sudah tertutup
-        c1_open, c1_close = float(klines[0][1]), float(klines[0][4])
-        c2_open, c2_close = float(klines[1][1]), float(klines[1][4])
-        
-        c1_pct = ((c1_close - c1_open) / c1_open) * 100
-        c2_pct = ((c2_close - c2_open) / c2_open) * 100
-        
-        return c1_pct, c2_pct, float(klines[1][4]) # Return data tertutup terakhir
-    except Exception as e:
-        return None
+        # Ambil 2 candle terakhir (1 close, 1 running)
+        klines = client.futures_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=2)
+        if len(klines) >= 2:
+            c1_open, c1_close = float(klines[0][1]), float(klines[0][4])
+            c1_pct = ((c1_close - c1_open) / c1_open) * 100
+            
+            coin_data[symbol] = {
+                'prev_pct': c1_pct,
+                'signal_sent': False
+            }
+            return True
+    except Exception:
+        pass
+    return False
 
-def check_signal(symbol, tf_key, c1_pct, c2_pct, price):
-    """Logika utama: C1 > 1% dan C2 > 2%"""
-    if c1_pct > 1.0 and c2_pct > 2.0:
-        print(f"🚀 SIGNAL [{tf_key}] {symbol}: {c1_pct:.2f}% -> {c2_pct:.2f}%")
-        msg = (
-            f"🚀 *FUTURES SIGNAL: {symbol}*\n\n"
-            f"⏱️ *Timeframe:* {tf_key}\n"
-            f"1️⃣ *Candle 1:* `+{c1_pct:.2f}%` (Closed)\n"
-            f"2️⃣ *Candle 2:* `+{c2_pct:.2f}%` (Closed)\n"
-            f"💰 *Price:* `{price}`\n\n"
-            f"🔗 [Binance Chart](https://www.binance.com/en/futures/{symbol})"
-        )
-        send_telegram(msg)
+def init_all_coins(symbols):
+    """Fungsi untuk inisialisasi awal semua koin menggunakan Threading agar cepat."""
+    print(f"[*] Mengunduh data awal untuk {len(symbols)} koin. Mohon tunggu...")
+    threads = []
+    
+    def worker(sym):
+        if not init_historical_data(sym):
+            # Jika gagal, buat default memori
+            coin_data[sym] = {'prev_pct': 0.0, 'signal_sent': False}
+
+    for sym in symbols:
+        t = threading.Thread(target=worker, args=(sym,))
+        threads.append(t)
+        t.start()
+        
+    for t in threads:
+        t.join()
+        
+    print("[√] Inisialisasi data selesai. Bot siap memindai secara real-time!")
 
 def socket_callback(msg):
-    """Handler data dari WebSocket."""
+    """Handler data Real-Time dari WebSocket."""
     try:
         if 'data' not in msg: return
         d = msg['data']
         symbol = d['s']
         candle = d['k']
-        tf_code = candle['i'] # misal '15m', '1h'
-        is_closed = candle['x']
         
-        # Cari tf_key dari value
-        tf_key = next((k for k, v in TIMEFRAMES.items() if v == tf_code), None)
-        if not tf_key: return
+        is_closed = candle['x']
+        c_open = float(candle['o'])
+        c_curr = float(candle['c'])
+        
+        # Hitung persentase candle yang sedang berjalan SAAT INI (Detik ini)
+        curr_pct = ((c_curr - c_open) / c_open) * 100
+        
+        if symbol not in coin_data:
+            return
 
-        if is_closed:
-            open_p = float(candle['o'])
-            close_p = float(candle['c'])
-            current_pct = ((close_p - open_p) / open_p) * 100
+        prev_pct = coin_data[symbol]['prev_pct']
+        signal_sent = coin_data[symbol]['signal_sent']
+
+        # ==========================================================
+        # LOGIKA FAST SCANNER (REAL-TIME TRIGGER)
+        # Jika Candle 1 > 1% DAN Candle 2 menyentuh > 2% SAAT INI
+        # ==========================================================
+        if prev_pct > 1.0 and curr_pct > 2.0 and not signal_sent:
+            print(f"⚡ INSTANT SIGNAL: {symbol} | Prev: {prev_pct:.2f}% | Now: {curr_pct:.2f}%")
             
-            # Jika data di memori kosong, gunakan REST API Fallback
-            if symbol not in analysis_data[tf_key]:
-                print(f"[*] Initializing {symbol} {tf_key} via REST API...")
-                hist = get_historical_data(symbol, tf_key)
-                if hist:
-                    c1, c2, last_p = hist
-                    analysis_data[tf_key][symbol] = c2 # Simpan candle terakhir yang close
-                    check_signal(symbol, tf_key, c1, c2, last_p)
-            else:
-                # Jika sudah ada di memori, bandingkan data baru dengan data sebelumnya
-                prev_pct = analysis_data[tf_key][symbol]
-                check_signal(symbol, tf_key, prev_pct, current_pct, close_p)
-                # Update memori
-                analysis_data[tf_key][symbol] = current_pct
+            alert_msg = (
+                f"⚡ *FAST SCALPING SIGNAL* ⚡\n\n"
+                f"💰 *Koin:* #{symbol}\n"
+                f"⏱️ *Timeframe:* 1 Menit (1m)\n"
+                f"🟢 *Candle Sebelumnya:* `+{prev_pct:.2f}%`\n"
+                f"🚀 *Candle Berjalan:* `+{curr_pct:.2f}%` (Real-Time)\n"
+                f"💵 *Harga Breakout:* `{c_curr}`\n\n"
+                f"⚠️ _Sinyal instan. Harga sedang melesat naik!_"
+            )
+            send_telegram(alert_msg)
+            
+            # Kunci sinyal agar tidak spam berkali-kali di candle yang sama
+            coin_data[symbol]['signal_sent'] = True
+
+        # Jika candle 1 menit ini sudah tertutup, simpan datanya untuk candle berikutnya
+        if is_closed:
+            coin_data[symbol]['prev_pct'] = curr_pct
+            # Reset pengunci sinyal untuk candle menit berikutnya
+            coin_data[symbol]['signal_sent'] = False
+
     except Exception as e:
         pass
 
-# --- FUNGSI TAMBAHAN: SCAN HISTORICAL 2 HARI ---
-def scan_historical_signals_2_days(symbols):
-    """Mencari sinyal dari 2 hari ke belakang dan mengirimkannya."""
-    print("[*] Memulai pemindaian data historis 2 hari ke belakang...")
+def run_fast_scanner():
+    print("==============================================")
+    print("   🚀 BINANCE ULTRA-FAST MOMENTUM SCANNER")
+    print("   [Mode: 1 Menit & Real-Time Trigger]")
+    print("==============================================")
     
-    # Limit candle untuk merepresentasikan 2 hari (48 jam)
-    limit_map = {
-        '15m': 48 * 4,  # 192 candle
-        '1h': 48,       # 48 candle
-        '4h': 12        # 12 candle
-    }
-    
-    for symbol in symbols:
-        for tf_key, interval in TIMEFRAMES.items():
-            try:
-                limit = limit_map[tf_key]
-                # Mengambil data historis sesuai limit timeframe
-                klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
-                
-                if len(klines) < 3:
-                    continue
-                    
-                # Iterasi dari candle tertua ke terbaru
-                for i in range(1, len(klines) - 1): # Abaikan index 0 (tidak punya prev) dan index terakhir (sedang berjalan)
-                    c1_open = float(klines[i-1][1])
-                    c1_close = float(klines[i-1][4])
-                    c1_pct = ((c1_close - c1_open) / c1_open) * 100
-                    
-                    c2_open = float(klines[i][1])
-                    c2_close = float(klines[i][4])
-                    c2_pct = ((c2_close - c2_open) / c2_open) * 100
-                    
-                    if c1_pct > 1.0 and c2_pct > 2.0:
-                        # Konversi waktu UNIX dari Binance ke format yang bisa dibaca
-                        close_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(klines[i][6] / 1000))
-                        price = c2_close
-                        
-                        print(f"🕰️ HISTORICAL SIGNAL [{tf_key}] {symbol} at {close_time}")
-                        msg = (
-                            f"🕰️ *HISTORICAL SIGNAL (Past 2 Days)*\n\n"
-                            f"💎 *Symbol:* #{symbol}\n"
-                            f"⏱️ *Timeframe:* {tf_key}\n"
-                            f"📅 *Waktu Close:* {close_time}\n"
-                            f"1️⃣ *Candle 1:* `+{c1_pct:.2f}%`\n"
-                            f"2️⃣ *Candle 2:* `+{c2_pct:.2f}%`\n"
-                            f"💰 *Price (Then):* `{price}`\n\n"
-                            f"🔗 [Binance Chart](https://www.binance.com/en/futures/{symbol})"
-                        )
-                        send_telegram(msg)
-                        time.sleep(0.2) # Jeda agar tidak terkena limit spam dari Telegram
-                        
-                time.sleep(0.05) # Jeda ringan untuk menjaga batas rate limit API Binance
-            except Exception as e:
-                pass # Lewati jika ada error pada koin tertentu
-                
-    print("[*] ✅ Pemindaian data historis 2 hari telah selesai.")
-
-def run_scanner():
-    print("=== BINANCE HYBRID MULTI-TF SCANNER STARTED ===")
-    print(f"Monitoring: {list(TIMEFRAMES.keys())}")
-    
-    # Ambil semua simbol futures aktif
+    # Ambil semua simbol futures yang aktif
     try:
         info = client.futures_exchange_info()
         symbols = [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['status'] == 'TRADING']
-        print(f"[*] Scanning {len(symbols)} market koin...")
     except Exception as e:
-        print(f"[!] Gagal ambil daftar simbol: {e}")
+        print(f"[!] Gagal mengambil market: {e}")
         return
 
-    # --- TAMBAHAN: Jalankan scan riwayat di thread terpisah ---
-    threading.Thread(target=scan_historical_signals_2_days, args=(symbols,), daemon=True).start()
+    # Inisialisasi data historis (1 menit ke belakang)
+    init_all_coins(symbols)
 
-    bsm = BinanceSocketManager(client)
-    
-    # Daftarkan semua stream (Multi-TF untuk semua koin)
-    streams = []
-    for s in symbols:
-        for tf in TIMEFRAMES.values():
-            streams.append(f"{s.lower()}@kline_{tf}")
-    
-    # Mulai koneksi WebSocket Multiplex
-    # Catatan: Binance mengizinkan banyak stream dalam satu koneksi
-    # Kita pecah jadi beberapa koneksi jika terlalu banyak (otomatis ditangani library)
-    bsm.start_multiplex_socket(streams, socket_callback)
-    bsm.start()
+    # Siapkan koneksi WebSocket (1 menit TF)
+    streams = [f"{s.lower()}@kline_1m" for s in symbols]
+    twm = ThreadedWebsocketManager(api_key=BINANCE_API_KEY, api_secret=BINANCE_SECRET_KEY)
+    twm.start()
+
+    # Pecah stream menjadi chunk berisi 200 (Batas Binance)
+    chunk_size = 200
+    for i in range(0, len(streams), chunk_size):
+        chunk = streams[i:i + chunk_size]
+        twm.start_futures_multiplex_socket(callback=socket_callback, streams=chunk)
+        time.sleep(1)
+
+    print(f"[*] {len(streams)} Streams WebSocket Aktif! Memantau lonjakan harga...")
 
 if __name__ == "__main__":
     try:
-        run_scanner()
-        # Menjaga script tetap hidup
+        run_fast_scanner()
         while True:
             time.sleep(10)
     except KeyboardInterrupt:
-        print("\n[!] Bot stopped.")
+        print("\n[!] Bot dihentikan.")
