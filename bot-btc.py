@@ -16,28 +16,29 @@ TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8000712659:AAHltp77nGuakOzW9Q
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003842052901')
 
 # ==========================================
-# PENGATURAN BOT (HANYA BTC, 4 TIMEFRAME)
+# PENGATURAN BOT (HANYA BTC)
 # ==========================================
 SYMBOLS = ['BTC/USDT']
-TIMEFRAMES = ['5m', '15m', '1h', '4h']
+TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h']
 LIMIT = 100 
 
-# Inisialisasi exchange Binance
 exchange = ccxt.binance({
     'apiKey': BINANCE_API_KEY,
     'secret': BINANCE_SECRET_KEY,
     'enableRateLimit': True,
 })
 
-# Memori bot
-prediction_history = {sym: {tf: None for tf in TIMEFRAMES} for sym in SYMBOLS}
+# [BARU] MEMORI TERKUNCI: Menyimpan prediksi TEPAT SETELAH dikirim ke Telegram
+locked_predictions = {sym: {tf: None for tf in TIMEFRAMES} for sym in SYMBOLS}
 last_signaled_candle = {sym: {tf: None for tf in TIMEFRAMES} for sym in SYMBOLS}
 
-# Lock untuk mencegah teks di terminal bertabrakan saat threading
-print_lock = threading.Lock()
+# MEMORI STATISTIK 1 JAM
+performance_stats = {tf: {'benar': 0, 'salah': 0} for tf in TIMEFRAMES}
+last_report_time = datetime.now()
+stats_lock = threading.Lock()     
+print_lock = threading.Lock()     
 
 def send_telegram_message(message):
-    """Mengirim pesan ke Telegram"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
@@ -49,8 +50,50 @@ def send_telegram_message(message):
         with print_lock:
             print(f"⚠️ Error koneksi Telegram: {e}")
 
+def send_hourly_report():
+    global last_report_time
+    
+    table_str = "<b>📊 REKAP AKURASI PREDIKSI (1 JAM TERAKHIR) 📊</b>\n"
+    table_str += "<pre>\n"
+    table_str += f"{'TF':<5} | {'BENAR':<6} | {'SALAH':<6} | {'AKURASI':<7}\n"
+    table_str += "-" * 34 + "\n"
+    
+    total_benar = 0
+    total_salah = 0
+    
+    with stats_lock:
+        for tf in TIMEFRAMES:
+            benar = performance_stats[tf]['benar']
+            salah = performance_stats[tf]['salah']
+            total = benar + salah
+            akurasi = (benar / total * 100) if total > 0 else 0.0
+            
+            table_str += f"{tf:<5} | {benar:<6} | {salah:<6} | {akurasi:>6.1f}%\n"
+            
+            total_benar += benar
+            total_salah += salah
+            
+            performance_stats[tf]['benar'] = 0
+            performance_stats[tf]['salah'] = 0
+        
+        last_report_time = datetime.now()
+
+    table_str += "-" * 34 + "\n"
+    total_all = total_benar + total_salah
+    total_akurasi = (total_benar / total_all * 100) if total_all > 0 else 0.0
+    table_str += f"{'TOTAL':<5} | {total_benar:<6} | {total_salah:<6} | {total_akurasi:>6.1f}%\n"
+    table_str += "</pre>\n"
+    table_str += "<i>*Sistem Anti-Curang Aktif: Prediksi dikunci saat sinyal dikirim.</i>"
+    
+    send_telegram_message(table_str)
+    
+    clean_terminal_text = table_str.replace("<b>", "").replace("</b>", "").replace("<pre>\n", "").replace("</pre>\n", "").replace("<i>", "").replace("</i>", "")
+    with print_lock:
+        print(f"\n======================================================")
+        print(clean_terminal_text)
+        print(f"======================================================\n")
+
 def calculate_indicators(df):
-    """Menghitung indikator teknikal (Lama + BBMA)"""
     df['EMA_9'] = df['close'].ewm(span=9, adjust=False).mean()
     df['EMA_21'] = df['close'].ewm(span=21, adjust=False).mean()
 
@@ -61,7 +104,6 @@ def calculate_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     df['AVG_VOL'] = df['volume'].rolling(window=20).mean()
 
-    # Bollinger Bands & Moving Averages untuk BBMA
     df['SMA_20'] = df['close'].rolling(window=20).mean()
     df['STD_20'] = df['close'].rolling(window=20).std()
     df['BB_UPPER'] = df['SMA_20'] + (df['STD_20'] * 2)
@@ -76,7 +118,6 @@ def calculate_indicators(df):
     return df
 
 def analyze_bbma(df):
-    """Setup Utama BBMA"""
     curr, prev = df.iloc[-1], df.iloc[-2]
     setup = "Konsolidasi / Belum ada Setup ⚪"
 
@@ -92,17 +133,24 @@ def analyze_bbma(df):
     return setup
 
 def evaluate_past_prediction(symbol, tf, closed_candle, past_prediction):
-    """Evaluasi memori lama"""
     actual_dir = "UP 🟢" if closed_candle['close'] > closed_candle['open'] else "DOWN 🔴"
+    
+    # Membaca data yang sudah DIKUNCI
     pred_dir = past_prediction['pred_dir']
     pred_dir_icon = "UP 🟢" if pred_dir == "UP" else "DOWN 🔴"
     
-    eval_text = f"<b>📊 EVALUASI {symbol} ({tf})</b>\nCandle Tutup: {actual_dir} | Prediksi Bot: {pred_dir_icon}\n"
+    eval_text = f"<b>📊 EVALUASI {symbol} ({tf})</b>\nCandle Tutup: {actual_dir} | Prediksi Awal Bot: {pred_dir_icon}\n"
 
     if (actual_dir == "UP 🟢" and pred_dir == "UP") or (actual_dir == "DOWN 🔴" and pred_dir == "DOWN"):
-        return eval_text + "✅ <b>Hasil: AKURAT</b>."
+        with stats_lock:
+            performance_stats[tf]['benar'] += 1
+        return eval_text + "✅ <b>Hasil: BENAR</b>."
 
-    eval_text += "❌ <b>Hasil: MISS</b>. Penyebab:\n"
+    # Jika salah, bot wajib evaluasi penyebabnya (Tidak akan memalsukan data)
+    with stats_lock:
+        performance_stats[tf]['salah'] += 1
+
+    eval_text += "❌ <b>Hasil: SALAH</b>. Penyebab:\n"
     body_size = abs(closed_candle['close'] - closed_candle['open'])
     upper_wick = closed_candle['high'] - max(closed_candle['open'], closed_candle['close'])
     lower_wick = min(closed_candle['open'], closed_candle['close']) - closed_candle['low']
@@ -120,7 +168,6 @@ def evaluate_past_prediction(symbol, tf, closed_candle, past_prediction):
     return eval_text
 
 def process_data(symbol, tf):
-    """Memproses data 1 koin (Akan dipanggil bersamaan oleh Threading)"""
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=LIMIT)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -135,26 +182,33 @@ def process_data(symbol, tf):
 
         # Prediksi Dasar
         pred_dir = "UP" if current_price > open_price else ("DOWN" if current_price < open_price else "NETRAL")
-        candle_status = "UP 🟢" if pred_dir == "UP" and rsi < 70 else ("UP (Rawan Koreksi) 🟡" if pred_dir == "UP" else ("DOWN 🔴" if rsi > 30 else "DOWN (Rawan Mantul) 🟡"))
-        if pred_dir == "NETRAL": candle_status = "NETRAL ⚪"
+        
+        # Jika candle baru mulai dan harga persis sama, kita gunakan tren EMA agar prediksi tidak NETRAL
+        if pred_dir == "NETRAL":
+            pred_dir = "UP" if ema9 > ema21 else "DOWN"
 
+        candle_status = "UP 🟢" if pred_dir == "UP" and rsi < 70 else ("UP (Rawan Koreksi) 🟡" if pred_dir == "UP" else ("DOWN 🔴" if rsi > 30 else "DOWN (Rawan Mantul) 🟡"))
+        
         trend_prediction = "Tren Naik 📈" if ema9 > ema21 else "Tren Turun 📉"
         bbma_setup = analyze_bbma(df)
 
         eval_result_text = ""
         
         # --------------------------------------------------------
-        # TELEGRAM: Diproses saat ada pergantian Candle
+        # KONDISI: CANDLE BARU TERBENTUK (Kirim Telegram & Kunci Data)
         # --------------------------------------------------------
         if last_signaled_candle[symbol][tf] != current_candle['timestamp']:
             telegram_message = ""
-            past_pred = prediction_history[symbol][tf]
+            
+            # 1. EVALUASI PREDIKSI SEBELUMNYA (Berdasarkan data yang terkunci)
+            past_pred = locked_predictions[symbol][tf]
             
             if past_pred is not None and past_pred['timestamp'] == closed_candle['timestamp']:
                 eval_result = evaluate_past_prediction(symbol, tf, closed_candle, past_pred)
                 telegram_message += eval_result + "\n\n"
-                eval_result_text = f"\n{eval_result.replace('<b>', '').replace('</b>', '')}" # Disimpan untuk terminal
+                eval_result_text = f"\n{eval_result.replace('<b>', '').replace('</b>', '')}"
                 
+            # 2. KIRIM SINYAL BARU KE TELEGRAM
             telegram_message += f"<b>🔮 SINYAL BARU {symbol} ({tf})</b>\n"
             telegram_message += f"Harga Buka: ${open_price:.4f}\n"
             telegram_message += f"Sinyal Candle: {candle_status}\n"
@@ -164,14 +218,20 @@ def process_data(symbol, tf):
             
             send_telegram_message(telegram_message)
             
+            # 3. KUNCI PREDIKSI! (Disimpan setelah dikirim, tidak akan diubah lagi)
+            locked_predictions[symbol][tf] = {
+                'timestamp': current_candle['timestamp'],
+                'pred_dir': pred_dir
+            }
+            
             last_signaled_candle[symbol][tf] = current_candle['timestamp']
-            prediction_history[symbol][tf] = None
 
-        if pred_dir != "NETRAL":
-            prediction_history[symbol][tf] = {'timestamp': current_candle['timestamp'], 'pred_dir': pred_dir}
+        # CATATAN PENTING:
+        # Blok update prediksi yang berjalan setiap 30 detik (curang) telah DIHAPUS.
+        # Data prediksi sekarang murni berdasarkan apa yang dikirim ke Telegram di awal candle.
 
         # --------------------------------------------------------
-        # TAMPILAN TERMINAL LOKAL (Menggunakan Lock agar rapi)
+        # TAMPILAN TERMINAL LOKAL
         # --------------------------------------------------------
         price_diff = current_price - open_price
         diff_sym = "+" if price_diff >= 0 else ""
@@ -181,8 +241,8 @@ def process_data(symbol, tf):
             terminal_output += eval_result_text + "\n"
         terminal_output += f"\n🪙 {symbol} [{tf}]"
         terminal_output += f"\n  Open: ${open_price:.4f} | Now: ${current_price:.4f} ({diff_sym}{price_diff:.4f})"
-        terminal_output += f"\n       ► Prediksi : {candle_status} | Tren: {trend_prediction}"
-        terminal_output += f"\n       ► Setup BBMA: {bbma_setup}"
+        terminal_output += f"\n       ► Arah Saat Ini : {candle_status} | Tren: {trend_prediction}"
+        terminal_output += f"\n       ► Setup BBMA    : {bbma_setup}"
 
         with print_lock:
             print(terminal_output)
@@ -193,18 +253,19 @@ def process_data(symbol, tf):
 
 def run_bot():
     print("======================================================")
-    print("🚀 BOT CRYPTO TELEGRAM + BBMA (FOKUS BTC) 🚀")
+    print("🚀 BOT CRYPTO TELEGRAM + BBMA (JUJUR & ANTI-CURANG) 🚀")
     print("======================================================\n")
 
-    send_telegram_message("🤖 <b>Bot Prediksi (Fokus BTC) Menyala!</b>\nSiap memantau BTC/USDT.\nTimeframe: 5m, 15m, 1h, & 4h.")
+    send_telegram_message("🤖 <b>Bot Prediksi Jujur Menyala!</b>\nSiap memantau BTC/USDT.\nTimeframe: 1m, 5m, 15m, 1h, & 4h.\n\n🔒 <i>Prediksi dikunci otomatis setelah sinyal dikirim. Bot akan evaluasi 'SALAH' jika meleset.</i>")
+
+    global last_report_time
+    last_report_time = datetime.now() 
 
     while True:
         print(f"\n\n======================================================")
-        print(f"🔄 Memindai Tren BTC (5m, 15m, 1h, 4h): {datetime.now().strftime('%H:%M:%S')}")
+        print(f"🔄 Memantau BTC Serentak: {datetime.now().strftime('%H:%M:%S')}")
         print(f"======================================================")
         
-        # MENGGUNAKAN THREADING UNTUK SCAN PARALEL
-        # max_workers diatur dinamis berdasarkan jumlah symbol * timeframe
         total_tasks = len(SYMBOLS) * len(TIMEFRAMES)
         with concurrent.futures.ThreadPoolExecutor(max_workers=total_tasks) as executor:
             futures = []
@@ -212,10 +273,14 @@ def run_bot():
                 for tf in TIMEFRAMES:
                     futures.append(executor.submit(process_data, symbol, tf))
             
-            # Tunggu sampai semua thread selesai bekerja
             concurrent.futures.wait(futures)
+        
+        # CEK REKAP 1 JAM (3600 Detik)
+        time_elapsed = (datetime.now() - last_report_time).total_seconds()
+        if time_elapsed >= 3600:
+            send_hourly_report()
                     
-        print("\n⏳ Scan Selesai. Menunggu 30 detik untuk scan berikutnya...")
+        print("\n⏳ Menunggu 30 detik untuk scan berikutnya...")
         time.sleep(30)
 
 if __name__ == "__main__":
