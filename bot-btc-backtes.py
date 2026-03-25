@@ -2,7 +2,7 @@ import ccxt
 import pandas as pd
 import numpy as np
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
 import requests
 import concurrent.futures
@@ -29,11 +29,20 @@ exchange = ccxt.binance({
     'enableRateLimit': True,
 })
 
-# MEMORI TERKUNCI & STATISTIK (Real-Time)
+# ==========================================
+# MEMORI TERKUNCI & AI ADAPTIF
+# ==========================================
 locked_predictions = {sym: {tf: None for tf in TIMEFRAMES} for sym in SYMBOLS}
 last_signaled_candle = {sym: {tf: None for tf in TIMEFRAMES} for sym in SYMBOLS}
+
 performance_stats = {tf: {'benar': 0, 'salah': 0} for tf in TIMEFRAMES}
 last_report_time = datetime.now()
+
+# [BARU] Memori Cerdas untuk Evaluasi Diri (Menyimpan 10 tebakan terakhir)
+recent_accuracy = {tf: [] for tf in TIMEFRAMES}
+# [BARU] Ambang batas (Threshold) dinamis. Makin tinggi, bot makin pelit kasih sinyal.
+dynamic_thresholds = {tf: 0 for tf in TIMEFRAMES} 
+
 stats_lock = threading.Lock()     
 print_lock = threading.Lock()     
 
@@ -48,8 +57,8 @@ def send_telegram_message(message):
 
 def send_hourly_report():
     global last_report_time
-    table_str = "<b>📊 REKAP AKURASI PREDIKSI (1 JAM TERAKHIR) 📊</b>\n<pre>\n"
-    table_str += f"{'TF':<5} | {'BENAR':<6} | {'SALAH':<6} | {'AKURASI':<7}\n"
+    table_str = "<b>📊 REKAP AKURASI & STATUS AI (1 JAM) 📊</b>\n<pre>\n"
+    table_str += f"{'TF':<4} | {'BNR':<3} | {'SLH':<3} | {'AKURASI':<7} | {'MODE':<6}\n"
     table_str += "-" * 34 + "\n"
     
     total_benar = 0
@@ -62,7 +71,11 @@ def send_hourly_report():
             total = benar + salah
             akurasi = (benar / total * 100) if total > 0 else 0.0
             
-            table_str += f"{tf:<5} | {benar:<6} | {salah:<6} | {akurasi:>6.1f}%\n"
+            # Tentukan text mode filter
+            t_hold = dynamic_thresholds[tf]
+            mode_text = f"KT+{t_hold}" if t_hold > 0 else "NRML"
+            
+            table_str += f"{tf:<4} | {benar:<3} | {salah:<3} | {akurasi:>6.1f}% | {mode_text:<6}\n"
             total_benar += benar
             total_salah += salah
             
@@ -73,8 +86,8 @@ def send_hourly_report():
     table_str += "-" * 34 + "\n"
     total_all = total_benar + total_salah
     total_akurasi = (total_benar / total_all * 100) if total_all > 0 else 0.0
-    table_str += f"{'TOTAL':<5} | {total_benar:<6} | {total_salah:<6} | {total_akurasi:>6.1f}%\n</pre>\n"
-    table_str += "<i>*Sistem Anti-Curang Aktif (Lock Prediksi).</i>"
+    table_str += f"{'ALL':<4} | {total_benar:<3} | {total_salah:<3} | {total_akurasi:>6.1f}%\n</pre>\n"
+    table_str += "<i>*KT = Ketat (Bot memfilter sinyal jelek). NRML = Normal.</i>"
     
     send_telegram_message(table_str)
     
@@ -159,46 +172,46 @@ def analyze_bbma(df):
     elif curr['close'] < curr['MA50'] and (curr['high'] >= curr['MA5_HIGH'] or curr['high'] >= curr['MA10_HIGH']): setup = "Re-entry SELL 🎯🔴"
     return setup
 
-def generate_master_score(df):
+def generate_master_score(df, threshold_adjustment):
+    """Sistem Voting dengan Ambang Batas (Threshold) Adaptif"""
     curr, prev = df.iloc[-1], df.iloc[-2]
     score = 0
     reasons_up, reasons_down = [], []
 
     if curr['close'] > curr['open']: score += 1; reasons_up.append("PriceAction")
     else: score -= 1; reasons_down.append("PriceAction")
-
     if curr['EMA_9'] > curr['EMA_21']: score += 1; reasons_up.append("EMA")
     else: score -= 1; reasons_down.append("EMA")
-
     if curr['MACD'] > curr['MACD_SIGNAL']: score += 1; reasons_up.append("MACD")
     else: score -= 1; reasons_down.append("MACD")
-
     if curr['RSI'] < 30: score += 2; reasons_up.append("RSI(Oversold)")
     elif curr['RSI'] > 70: score -= 2; reasons_down.append("RSI(Overbought)")
     elif curr['RSI'] > 50: score += 1; reasons_up.append("RSI(>50)")
     else: score -= 1; reasons_down.append("RSI(<50)")
-
     if curr['STOCH_K'] > curr['STOCH_D']:
         if curr['STOCH_K'] < 20: score += 2; reasons_up.append("Stoch(Oversold)")
         else: score += 1; reasons_up.append("Stoch")
     else:
         if curr['STOCH_K'] > 80: score -= 2; reasons_down.append("Stoch(Overbought)")
         else: score -= 1; reasons_down.append("Stoch")
-
-    if curr['OBV'] > prev['OBV']: score += 1; reasons_up.append("OBV(Akumulasi)")
-    else: score -= 1; reasons_down.append("OBV(Distribusi)")
-
+    if curr['OBV'] > prev['OBV']: score += 1; reasons_up.append("OBV(Akum)")
+    else: score -= 1; reasons_down.append("OBV(Dist)")
     if curr['CMF'] > 0: score += 1; reasons_up.append("CMF(+)")
     else: score -= 1; reasons_down.append("CMF(-)")
-
     if curr['SMI'] > curr['SMI_SIGNAL']: score += 1; reasons_up.append("SMI")
     else: score -= 1; reasons_down.append("SMI")
-
     if curr['ADX'] > 25:
         if curr['+DI'] > curr['-DI']: score += 2; reasons_up.append("ADX(Strong UP)")
         else: score -= 2; reasons_down.append("ADX(Strong DOWN)")
 
-    final_dir = "UP" if score >= 0 else "DOWN"
+    # [BARU] Logika Mode Ketat (Filter Sinyal Labil)
+    if score > threshold_adjustment: 
+        final_dir = "UP"
+    elif score < -threshold_adjustment: 
+        final_dir = "DOWN"
+    else: 
+        final_dir = "NETRAL" # Skor tidak cukup kuat untuk menebak
+
     return {
         'score': score, 'final_dir': final_dir,
         'up_votes': len(reasons_up), 'down_votes': len(reasons_down),
@@ -208,29 +221,55 @@ def generate_master_score(df):
 def evaluate_past_prediction(symbol, tf, closed_candle, past_prediction):
     actual_dir = "UP 🟢" if closed_candle['close'] > closed_candle['open'] else "DOWN 🔴"
     pred_dir = past_prediction['pred_dir']
-    pred_dir_icon = "UP 🟢" if pred_dir == "UP" else "DOWN 🔴"
     
+    # Jika Sinyal sebelumnya NETRAL (Wait & See), lewati evaluasi
+    if pred_dir == "NETRAL":
+        return f"<b>📊 EVALUASI {symbol} ({tf})</b>\nSinyal Sebelumnya: WAIT & SEE ⚪ (Dilewati)"
+
+    pred_dir_icon = "UP 🟢" if pred_dir == "UP" else "DOWN 🔴"
     eval_text = f"<b>📊 EVALUASI {symbol} ({tf})</b>\nCandle Tutup: {actual_dir} | Prediksi Bot: {pred_dir_icon}\n"
 
-    if (actual_dir == "UP 🟢" and pred_dir == "UP") or (actual_dir == "DOWN 🔴" and pred_dir == "DOWN"):
-        with stats_lock: performance_stats[tf]['benar'] += 1
-        return eval_text + "✅ <b>Hasil: BENAR</b>."
+    with stats_lock:
+        if (actual_dir == "UP 🟢" and pred_dir == "UP") or (actual_dir == "DOWN 🔴" and pred_dir == "DOWN"):
+            performance_stats[tf]['benar'] += 1
+            recent_accuracy[tf].append(1) # Simpan sejarah "Benar"
+            eval_text += "✅ <b>Hasil: BENAR</b>."
+        else:
+            performance_stats[tf]['salah'] += 1
+            recent_accuracy[tf].append(0) # Simpan sejarah "Salah"
+            
+            body_size = abs(closed_candle['close'] - closed_candle['open'])
+            up_w = closed_candle['high'] - max(closed_candle['open'], closed_candle['close'])
+            dn_w = min(closed_candle['open'], closed_candle['close']) - closed_candle['low']
+            vol_spike = closed_candle['volume'] > (closed_candle['AVG_VOL'] * 1.5)
+            
+            eval_text += "❌ <b>Hasil: SALAH</b>. Penyebab:\n"
+            if pred_dir == "UP" and "DOWN" in actual_dir:
+                if vol_spike: eval_text += "👉 Volume Jual Dadakan (Paus buang barang).\n"
+                elif up_w > body_size: eval_text += "👉 Gagal tembus resistensi (Jarum atas).\n"
+                else: eval_text += "👉 Momentum memudar mendadak.\n"
+            elif pred_dir == "DOWN" and "UP" in actual_dir:
+                if vol_spike: eval_text += "👉 Volume Beli Dadakan (Paus serok).\n"
+                elif dn_w > body_size: eval_text += "👉 Gagal tembus support (Jarum bawah).\n"
+                else: eval_text += "👉 Terjadi teknikal pantulan mendadak.\n"
 
-    with stats_lock: performance_stats[tf]['salah'] += 1
-    eval_text += "❌ <b>Hasil: SALAH</b>. Penyebab:\n"
-    body_size = abs(closed_candle['close'] - closed_candle['open'])
-    upper_wick = closed_candle['high'] - max(closed_candle['open'], closed_candle['close'])
-    lower_wick = min(closed_candle['open'], closed_candle['close']) - closed_candle['low']
-    vol_spike = closed_candle['volume'] > (closed_candle['AVG_VOL'] * 1.5)
+        # Membatasi memori 10 trade terakhir
+        if len(recent_accuracy[tf]) > 10:
+            recent_accuracy[tf].pop(0)
 
-    if pred_dir == "UP" and "DOWN" in actual_dir:
-        if vol_spike: eval_text += "👉 Volume Jual Dadakan (Paus buang barang).\n"
-        if upper_wick > body_size: eval_text += "👉 Gagal tembus resistensi (Jarum atas).\n"
-        if "👉" not in eval_text: eval_text += "👉 Momentum memudar drastis.\n"
-    elif pred_dir == "DOWN" and "UP" in actual_dir:
-        if vol_spike: eval_text += "👉 Volume Beli Dadakan (Paus serok).\n"
-        if lower_wick > body_size: eval_text += "👉 Gagal tembus support (Jarum bawah).\n"
-        if "👉" not in eval_text: eval_text += "👉 Terjadi teknikal pantulan mendadak.\n"
+        # [BARU] EVALUASI DIRI (SELF-CORRECTION AI)
+        if len(recent_accuracy[tf]) >= 5: # Evaluasi mulai jalan setelah 5 trade
+            acc_rate = sum(recent_accuracy[tf]) / len(recent_accuracy[tf])
+            
+            if acc_rate < 0.60: # Jika akurasi anjlok di bawah 60%
+                # Bot menaikkan standar skoringnya (+1 lebih ketat)
+                dynamic_thresholds[tf] = min(6, dynamic_thresholds[tf] + 1)
+                eval_text += f"\n\n⚠️ <i>AI Menganalisa Akurasi Turun ({acc_rate*100:.0f}%). Standar Filter Ditingkatkan (+{dynamic_thresholds[tf]})!</i>"
+            elif acc_rate >= 0.75: # Jika akurasi sangat bagus
+                # Bot sedikit melonggarkan standarnya agar lebih banyak sinyal masuk
+                if dynamic_thresholds[tf] > 0:
+                    dynamic_thresholds[tf] -= 1
+                    eval_text += f"\n\n✨ <i>Akurasi Membaik ({acc_rate*100:.0f}%). Standar Filter Dinormalkan.</i>"
 
     return eval_text
 
@@ -242,22 +281,24 @@ def process_data(symbol, tf):
         
         current_candle = df.iloc[-1]
         closed_candle = df.iloc[-2]
-        
         open_price = current_candle['open']
         current_price = current_candle['close']
         
-        master_analysis = generate_master_score(df)
+        # Ambil threshold terkini dari sistem AI
+        current_threshold = dynamic_thresholds[tf]
+        
+        master_analysis = generate_master_score(df, current_threshold)
         pred_dir = master_analysis['final_dir']
         score = master_analysis['score']
         
         if pred_dir == "UP":
             if score >= 5: candle_status = "STRONG UP 🚀"
-            elif score >= 2: candle_status = "UP 🟢"
-            else: candle_status = "WEAK UP 🟡"
-        else:
+            else: candle_status = "UP 🟢"
+        elif pred_dir == "DOWN":
             if score <= -5: candle_status = "STRONG DOWN ☄️"
-            elif score <= -2: candle_status = "DOWN 🔴"
-            else: candle_status = "WEAK DOWN 🟡"
+            else: candle_status = "DOWN 🔴"
+        else:
+            candle_status = "WAIT & SEE ⚪ (Konsolidasi/Labil)"
 
         bbma_setup = analyze_bbma(df)
         eval_result_text = ""
@@ -270,13 +311,20 @@ def process_data(symbol, tf):
                 telegram_message += eval_result + "\n\n"
                 eval_result_text = f"\n{eval_result.replace('<b>', '').replace('</b>', '')}"
                 
-            telegram_message += f"<b>🔮 SINYAL KONSENSUS {symbol} ({tf})</b>\n"
+            telegram_message += f"<b>🔮 SINYAL {symbol} ({tf})</b>\n"
+            
+            # Tampilan Peringatan Mode di Telegram
+            if current_threshold > 0:
+                telegram_message += f"🛡️ <b>Mode Ketat Aktif</b> (Filter: +{current_threshold})\n"
+            
             telegram_message += f"Prediksi Arah: <b>{candle_status}</b>\n"
             telegram_message += f"Skor Indikator: {score} poin\n\n"
-            telegram_message += f"✅ <b>Pendukung NAIK ({master_analysis['up_votes']}):</b>\n{master_analysis['details_up']}\n\n"
-            telegram_message += f"❌ <b>Pendukung TURUN ({master_analysis['down_votes']}):</b>\n{master_analysis['details_down']}\n\n"
+            
+            if pred_dir != "NETRAL":
+                telegram_message += f"✅ <b>Pendukung NAIK ({master_analysis['up_votes']}):</b>\n{master_analysis['details_up']}\n\n"
+                telegram_message += f"❌ <b>Pendukung TURUN ({master_analysis['down_votes']}):</b>\n{master_analysis['details_down']}\n\n"
+            
             telegram_message += f"<b>Setup BBMA: {bbma_setup}</b>\n"
-            telegram_message += f"Volatilitas (ATR): ${current_candle['ATR']:.2f}"
             
             send_telegram_message(telegram_message)
             
@@ -305,13 +353,13 @@ def process_data(symbol, tf):
             print(f"\n🪙 {symbol} [{tf}] ⚠️ Error: {e}")
 
 # ==========================================
-# FITUR BARU: BACKTEST 1 MINGGU KE BELAKANG
+# BACKTEST 1 MINGGU DENGAN AI ADAPTIF (60-80%)
 # ==========================================
 def run_backtest():
     print("\n⏳ MENGAMBIL DATA 1 MINGGU KE BELAKANG UNTUK BACKTEST...")
-    print("Bot sedang mensimulasikan indikator masa lalu. Mohon tunggu...\n")
+    print("Sistem Self-Correction AI akan aktif selama simulasi...\n")
     
-    send_telegram_message("⏳ <b>Proses Backtest Dimulai...</b>\nMensimulasikan data BTC/USDT 1 minggu terakhir. Hasil akan segera dikirim.")
+    send_telegram_message("⏳ <b>Proses Backtest Adaptive Dimulai...</b>\nMensimulasikan data BTC/USDT 1 minggu terakhir dengan fitur koreksi otomatis.")
     
     days = 7
     now_ms = exchange.milliseconds()
@@ -343,6 +391,10 @@ def run_backtest():
         
         benar = 0
         salah = 0
+        
+        # Variabel Memori AI Khusus Backtest
+        bt_history = []
+        bt_threshold = 0 
 
         for i in range(1, len(df)):
             curr = df.iloc[i-1] 
@@ -375,86 +427,82 @@ def run_backtest():
                 if curr['+DI'] > curr['-DI']: score += 2
                 else: score -= 2
 
-            pred_dir = "UP" if score >= 0 else "DOWN"
+            # Terapkan Threshold AI
+            if score > bt_threshold: pred_dir = "UP"
+            elif score < -bt_threshold: pred_dir = "DOWN"
+            else: pred_dir = "NETRAL"
+
             actual_dir = "UP" if df.iloc[i]['close'] > df.iloc[i]['open'] else "DOWN"
             
-            if pred_dir == actual_dir:
-                benar += 1
-            else:
-                salah += 1
+            # Catat & Evaluasi AI (Hanya jika bot berani menebak)
+            if pred_dir != "NETRAL":
+                if pred_dir == actual_dir:
+                    benar += 1
+                    bt_history.append(1)
+                else:
+                    salah += 1
+                    bt_history.append(0)
+                    
+                if len(bt_history) > 10: bt_history.pop(0)
+                
+                # Fitur Adaptif Aktif di masa lalu
+                if len(bt_history) == 10:
+                    acc = sum(bt_history) / 10
+                    if acc < 0.60: bt_threshold = min(5, bt_threshold + 1)
+                    elif acc > 0.75: bt_threshold = max(0, bt_threshold - 1)
                 
         total = benar + salah
         akurasi = (benar / total * 100) if total > 0 else 0
         results.append((tf, total, benar, salah, akurasi))
 
-    # ---- [BARU] FORMAT PESAN TELEGRAM UNTUK BACKTEST ----
-    telegram_msg = "<b>📊 HASIL BACKTEST 1 MINGGU (BTC/USDT) 📊</b>\n"
-    telegram_msg += "Sistem Konsensus Multi-Indikator\n"
+    telegram_msg = "<b>📊 HASIL BACKTEST ADAPTIF (1 MINGGU) 📊</b>\n"
+    telegram_msg += "Filter AI Otomatis (Target 60-80%)\n"
     telegram_msg += "<pre>\n"
     telegram_msg += f"{'TF':<4} | {'TOT':<4} | {'BNR':<4} | {'SLH':<4} | {'AKURASI':<7}\n"
     telegram_msg += "-" * 33 + "\n"
     
-    # Menampilkan Hasil di Terminal juga
     print("\n=======================================================================")
-    print("📊 HASIL BACKTEST 1 MINGGU TERAKHIR (BTC/USDT) - SISTEM KONSENSUS")
+    print("📊 HASIL BACKTEST ADAPTIF 1 MINGGU (TARGET: 60-80%)")
     print("=======================================================================")
-    print(f"{'TIMEFRAME':<10} | {'TOTAL CANDLE':<12} | {'BENAR':<8} | {'SALAH':<8} | {'AKURASI':<8}")
+    print(f"{'TIMEFRAME':<10} | {'TOTAL TEBAKAN':<13} | {'BENAR':<8} | {'SALAH':<8} | {'AKURASI':<8}")
     print("-" * 71)
     
-    total_semua = 0
-    benar_semua = 0
-    salah_semua = 0
+    total_semua = benar_semua = salah_semua = 0
 
     for res in results:
         tf, total, bnr, slh, akurasi = res
-        total_semua += total
-        benar_semua += bnr
-        salah_semua += slh
-        
-        # Tambah ke pesan telegram
+        total_semua += total; benar_semua += bnr; salah_semua += slh
         telegram_msg += f"{tf:<4} | {total:<4} | {bnr:<4} | {slh:<4} | {akurasi:>6.1f}%\n"
-        
-        # Cetak ke terminal
-        print(f"{tf:<10} | {total:<12} | {bnr:<8} | {slh:<8} | {akurasi:.2f}%")
+        print(f"{tf:<10} | {total:<13} | {bnr:<8} | {slh:<8} | {akurasi:.2f}%")
         
     akurasi_total_semua = (benar_semua / total_semua * 100) if total_semua > 0 else 0
     telegram_msg += "-" * 33 + "\n"
-    telegram_msg += f"{'ALL':<4} | {total_semua:<4} | {benar_semua:<4} | {salah_semua:<4} | {akurasi_total_semua:>6.1f}%\n"
-    telegram_msg += "</pre>"
+    telegram_msg += f"{'ALL':<4} | {total_semua:<4} | {benar_semua:<4} | {salah_semua:<4} | {akurasi_total_semua:>6.1f}%\n</pre>"
     
     print("=======================================================================\n")
-    
-    # KIRIM PESAN KE TELEGRAM
     send_telegram_message(telegram_msg)
-    print("✅ Hasil Backtest berhasil dikirim ke Telegram!")
-    
     input("Tekan [ENTER] untuk kembali ke Menu Utama...")
 
-# ==========================================
-# MAIN MENU (MENU UTAMA)
-# ==========================================
 def run_bot():
     print("\n======================================================")
     print("🚀 MENJALANKAN BOT REAL-TIME (Tekan Ctrl+C untuk Stop)")
     print("======================================================\n")
 
-    send_telegram_message("🤖 <b>Bot Ultimate Real-Time Dimulai!</b>\nMemantau BTC/USDT (1m, 5m, 15m, 1h, 4h).")
+    send_telegram_message("🤖 <b>Bot Adaptive AI Dimulai!</b>\nJika akurasi turun <60%, bot otomatis mengubah mode jadi KETAT (Filter Sinyal Labil).")
     global last_report_time
     last_report_time = datetime.now() 
 
     try:
         while True:
             print(f"\n======================================================")
-            print(f"🔄 Memantau BTC dengan 10+ Indikator: {datetime.now().strftime('%H:%M:%S')}")
+            print(f"🔄 Memantau BTC dengan AI Dinamis: {datetime.now().strftime('%H:%M:%S')}")
             print(f"======================================================")
             
-            total_tasks = len(SYMBOLS) * len(TIMEFRAMES)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=total_tasks) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(SYMBOLS)*len(TIMEFRAMES)) as executor:
                 futures = [executor.submit(process_data, sym, tf) for sym in SYMBOLS for tf in TIMEFRAMES]
                 concurrent.futures.wait(futures)
             
-            time_elapsed = (datetime.now() - last_report_time).total_seconds()
-            if time_elapsed >= 3600:
+            if (datetime.now() - last_report_time).total_seconds() >= 3600:
                 send_hourly_report()
                         
             print("\n⏳ Menunggu 30 detik untuk scan berikutnya...")
@@ -467,26 +515,22 @@ def run_bot():
 def main_menu():
     while True:
         os.system('cls' if os.name == 'nt' else 'clear') 
-        
         print("======================================================")
-        print("🌟 MENU UTAMA BOT CRYPTO ULTIMATE 🌟")
+        print("🌟 MENU UTAMA BOT CRYPTO ADAPTIVE AI 🌟")
         print("======================================================")
-        print("1. 🚀 Jalankan Prediksi Real-Time (Kirim Sinyal ke Telegram)")
-        print("2. 📊 Analisis Masa Lalu (Backtest 1 Minggu Kebelakang)")
+        print("1. 🚀 Jalankan Prediksi Real-Time (Fitur AI 60-80%)")
+        print("2. 📊 Analisis Masa Lalu (Backtest AI 1 Minggu Kebelakang)")
         print("3. ❌ Keluar / Matikan Program")
         print("======================================================")
         
         pilihan = input("👉 Pilih menu (1/2/3): ")
-        
-        if pilihan == '1':
-            run_bot()
-        elif pilihan == '2':
-            run_backtest()
+        if pilihan == '1': run_bot()
+        elif pilihan == '2': run_backtest()
         elif pilihan == '3':
-            print("\nTerima kasih telah menggunakan Bot Ultimate. Sampai jumpa!")
+            print("\nTerima kasih! Sampai jumpa.")
             break
         else:
-            print("\n⚠️ Pilihan tidak valid. Silakan coba lagi.")
+            print("\n⚠️ Pilihan tidak valid.")
             time.sleep(2)
 
 if __name__ == "__main__":
