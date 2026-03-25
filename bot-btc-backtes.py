@@ -1,6 +1,5 @@
 import ccxt
 import pandas as pd
-import numpy as np
 import time
 from datetime import datetime
 import os
@@ -21,7 +20,7 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003812500986')
 # ==========================================
 SYMBOLS = ['BTC/USDT']
 TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h']
-LIMIT = 300 
+LIMIT = 100 
 
 exchange = ccxt.binance({
     'apiKey': BINANCE_API_KEY,
@@ -30,19 +29,13 @@ exchange = ccxt.binance({
 })
 
 # ==========================================
-# MEMORI TERKUNCI & AI ADAPTIF
+# MEMORI TERKUNCI & STATISTIK
 # ==========================================
 locked_predictions = {sym: {tf: None for tf in TIMEFRAMES} for sym in SYMBOLS}
 last_signaled_candle = {sym: {tf: None for tf in TIMEFRAMES} for sym in SYMBOLS}
-
 performance_stats = {tf: {'benar': 0, 'salah': 0} for tf in TIMEFRAMES}
+
 last_report_time = datetime.now()
-
-# [BARU] Memori Cerdas untuk Evaluasi Diri (Menyimpan 10 tebakan terakhir)
-recent_accuracy = {tf: [] for tf in TIMEFRAMES}
-# [BARU] Ambang batas (Threshold) dinamis. Makin tinggi, bot makin pelit kasih sinyal.
-dynamic_thresholds = {tf: 0 for tf in TIMEFRAMES} 
-
 stats_lock = threading.Lock()     
 print_lock = threading.Lock()     
 
@@ -57,9 +50,9 @@ def send_telegram_message(message):
 
 def send_hourly_report():
     global last_report_time
-    table_str = "<b>📊 REKAP AKURASI & STATUS AI (1 JAM) 📊</b>\n<pre>\n"
-    table_str += f"{'TF':<4} | {'BNR':<3} | {'SLH':<3} | {'AKURASI':<7} | {'MODE':<6}\n"
-    table_str += "-" * 34 + "\n"
+    table_str = "<b>📊 REKAP AKURASI BOT FINAL (1 JAM) 📊</b>\n<pre>\n"
+    table_str += f"{'TF':<4} | {'BNR':<4} | {'SLH':<4} | {'AKURASI':<7}\n"
+    table_str += "-" * 33 + "\n"
     
     total_benar = 0
     total_salah = 0
@@ -71,11 +64,7 @@ def send_hourly_report():
             total = benar + salah
             akurasi = (benar / total * 100) if total > 0 else 0.0
             
-            # Tentukan text mode filter
-            t_hold = dynamic_thresholds[tf]
-            mode_text = f"KT+{t_hold}" if t_hold > 0 else "NRML"
-            
-            table_str += f"{tf:<4} | {benar:<3} | {salah:<3} | {akurasi:>6.1f}% | {mode_text:<6}\n"
+            table_str += f"{tf:<4} | {benar:<4} | {salah:<4} | {akurasi:>6.1f}%\n"
             total_benar += benar
             total_salah += salah
             
@@ -83,11 +72,11 @@ def send_hourly_report():
             performance_stats[tf]['salah'] = 0
         last_report_time = datetime.now()
 
-    table_str += "-" * 34 + "\n"
+    table_str += "-" * 33 + "\n"
     total_all = total_benar + total_salah
     total_akurasi = (total_benar / total_all * 100) if total_all > 0 else 0.0
-    table_str += f"{'ALL':<4} | {total_benar:<3} | {total_salah:<3} | {total_akurasi:>6.1f}%\n</pre>\n"
-    table_str += "<i>*KT = Ketat (Bot memfilter sinyal jelek). NRML = Normal.</i>"
+    table_str += f"{'ALL':<4} | {total_benar:<4} | {total_salah:<4} | {total_akurasi:>6.1f}%\n</pre>\n"
+    table_str += "<i>*Menghitung sinyal BBMA Extreme & Stochastic Cross.</i>"
     
     send_telegram_message(table_str)
     
@@ -95,181 +84,102 @@ def send_hourly_report():
     with print_lock:
         print(f"\n======================================================\n{clean_terminal}\n======================================================\n")
 
-def calculate_indicators(df):
-    """Menghitung Semua Indikator Dasar & Advance"""
-    df['EMA_9'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['EMA_21'] = df['close'].ewm(span=21, adjust=False).mean()
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss.replace(0, 0.0001) 
-    df['RSI'] = 100 - (100 / (1 + rs))
-    df['AVG_VOL'] = df['volume'].rolling(window=20).mean()
-
-    df['SMA_20'] = df['close'].rolling(window=20).mean()
+def calculate_reversal_indicators(df):
+    """MENGHITUNG BBMA OA & STOCHASTIC (5,3,3)"""
+    # --- 1. BBMA ---
+    df['MID_BB'] = df['close'].rolling(window=20).mean()
     df['STD_20'] = df['close'].rolling(window=20).std()
-    df['BB_UPPER'] = df['SMA_20'] + (df['STD_20'] * 2)
-    df['BB_LOWER'] = df['SMA_20'] - (df['STD_20'] * 2)
+    df['TOP_BB'] = df['MID_BB'] + (df['STD_20'] * 2)
+    df['LOW_BB'] = df['MID_BB'] - (df['STD_20'] * 2)
+
     df['MA5_HIGH'] = df['high'].rolling(window=5).mean()
     df['MA5_LOW'] = df['low'].rolling(window=5).mean()
-    df['MA10_HIGH'] = df['high'].rolling(window=10).mean()
-    df['MA10_LOW'] = df['low'].rolling(window=10).mean()
-    df['MA50'] = df['close'].rolling(window=50).mean()
+    df['AVG_VOL'] = df['volume'].rolling(window=20).mean()
 
-    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp1 - exp2
-    df['MACD_SIGNAL'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-    low14 = df['low'].rolling(14).min()
-    high14 = df['high'].rolling(14).max()
-    df['STOCH_K'] = 100 * ((df['close'] - low14) / (high14 - low14).replace(0, 0.0001))
-    df['STOCH_D'] = df['STOCH_K'].rolling(3).mean()
-
-    tr0 = abs(df['high'] - df['low'])
-    tr1 = abs(df['high'] - df['close'].shift())
-    tr2 = abs(df['low'] - df['close'].shift())
-    df['TR'] = pd.concat([tr0, tr1, tr2], axis=1).max(axis=1)
-    df['ATR'] = df['TR'].rolling(14).mean()
-
-    df['OBV'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
-
-    mfm = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low']).replace(0, 0.0001)
-    mfv = mfm * df['volume']
-    df['CMF'] = mfv.rolling(20).sum() / df['volume'].rolling(20).sum().replace(0, 0.0001)
-
-    c_m = df['close'] - (high14 + low14) / 2
-    hl_diff = high14 - low14
-    num = c_m.ewm(span=3, adjust=False).mean().ewm(span=3, adjust=False).mean()
-    den = hl_diff.ewm(span=3, adjust=False).mean().ewm(span=3, adjust=False).mean() / 2
-    df['SMI'] = 100 * (num / den.replace(0, 0.0001))
-    df['SMI_SIGNAL'] = df['SMI'].ewm(span=3, adjust=False).mean()
-
-    up = df['high'] - df['high'].shift(1)
-    down = df['low'].shift(1) - df['low']
-    df['+DM'] = np.where((up > down) & (up > 0), up, 0)
-    df['-DM'] = np.where((down > up) & (down > 0), down, 0)
-    tr_sm = df['TR'].ewm(span=14, adjust=False).mean()
-    pdm_sm = df['+DM'].ewm(span=14, adjust=False).mean()
-    mdm_sm = df['-DM'].ewm(span=14, adjust=False).mean()
-    df['+DI'] = 100 * (pdm_sm / tr_sm.replace(0, 0.0001))
-    df['-DI'] = 100 * (mdm_sm / tr_sm.replace(0, 0.0001))
-    dx = 100 * abs(df['+DI'] - df['-DI']) / (df['+DI'] + df['-DI']).replace(0, 0.0001)
-    df['ADX'] = dx.ewm(span=14, adjust=False).mean()
+    # --- 2. STOCHASTIC (K=5, D=3, Smooth=3) ---
+    low_min = df['low'].rolling(window=5).min()
+    high_max = df['high'].rolling(window=5).max()
+    fast_k = 100 * ((df['close'] - low_min) / (high_max - low_min).replace(0, 0.0001))
+    
+    df['STOCH_K'] = fast_k.rolling(window=3).mean()
+    df['STOCH_D'] = df['STOCH_K'].rolling(window=3).mean()
 
     return df
 
-def analyze_bbma(df):
-    curr, prev = df.iloc[-1], df.iloc[-2]
-    setup = "Konsolidasi ⚪"
-    if curr['close'] > curr['BB_UPPER']: setup = "Momentum BUY 🚀"
-    elif curr['close'] < curr['BB_LOWER']: setup = "Momentum SELL ☄️"
-    elif curr['MA5_HIGH'] > curr['BB_UPPER'] and curr['close'] <= curr['BB_UPPER']: setup = "Extreme SELL ⚠️🔴"
-    elif curr['MA5_LOW'] < curr['BB_LOWER'] and curr['close'] >= curr['BB_LOWER']: setup = "Extreme BUY ⚠️🟢"
-    elif prev['close'] > prev['BB_UPPER'] and curr['high'] <= curr['BB_UPPER']: setup = "MHV SELL 📉"
-    elif prev['close'] < prev['BB_LOWER'] and curr['low'] >= curr['BB_LOWER']: setup = "MHV BUY 📈"
-    elif curr['close'] > curr['MA50'] and (curr['low'] <= curr['MA5_LOW'] or curr['low'] <= curr['MA10_LOW']): setup = "Re-entry BUY 🎯🟢"
-    elif curr['close'] < curr['MA50'] and (curr['high'] >= curr['MA5_HIGH'] or curr['high'] >= curr['MA10_HIGH']): setup = "Re-entry SELL 🎯🔴"
-    return setup
+def detect_reversal_setup(curr, prev):
+    """
+    LOGIKA REVERSAL KHUSUS (BBMA EXTREME & STOCHASTIC CROSSOVER)
+    """
+    setup_name = "MENCARI SETUP ⚪"
+    direction = "NETRAL"
 
-def generate_master_score(df, threshold_adjustment):
-    """Sistem Voting dengan Ambang Batas (Threshold) Adaptif"""
-    curr, prev = df.iloc[-1], df.iloc[-2]
-    score = 0
-    reasons_up, reasons_down = [], []
+    # ==========================================
+    # LOGIKA 1: BBMA EXTREME (TETAP JALAN)
+    # ==========================================
+    bbma_sell = curr['MA5_HIGH'] > curr['TOP_BB'] and curr['close'] <= curr['TOP_BB'] and curr['close'] < curr['open']
+    bbma_buy = curr['MA5_LOW'] < curr['LOW_BB'] and curr['close'] >= curr['LOW_BB'] and curr['close'] > curr['open']
 
-    if curr['close'] > curr['open']: score += 1; reasons_up.append("PriceAction")
-    else: score -= 1; reasons_down.append("PriceAction")
-    if curr['EMA_9'] > curr['EMA_21']: score += 1; reasons_up.append("EMA")
-    else: score -= 1; reasons_down.append("EMA")
-    if curr['MACD'] > curr['MACD_SIGNAL']: score += 1; reasons_up.append("MACD")
-    else: score -= 1; reasons_down.append("MACD")
-    if curr['RSI'] < 30: score += 2; reasons_up.append("RSI(Oversold)")
-    elif curr['RSI'] > 70: score -= 2; reasons_down.append("RSI(Overbought)")
-    elif curr['RSI'] > 50: score += 1; reasons_up.append("RSI(>50)")
-    else: score -= 1; reasons_down.append("RSI(<50)")
-    if curr['STOCH_K'] > curr['STOCH_D']:
-        if curr['STOCH_K'] < 20: score += 2; reasons_up.append("Stoch(Oversold)")
-        else: score += 1; reasons_up.append("Stoch")
-    else:
-        if curr['STOCH_K'] > 80: score -= 2; reasons_down.append("Stoch(Overbought)")
-        else: score -= 1; reasons_down.append("Stoch")
-    if curr['OBV'] > prev['OBV']: score += 1; reasons_up.append("OBV(Akum)")
-    else: score -= 1; reasons_down.append("OBV(Dist)")
-    if curr['CMF'] > 0: score += 1; reasons_up.append("CMF(+)")
-    else: score -= 1; reasons_down.append("CMF(-)")
-    if curr['SMI'] > curr['SMI_SIGNAL']: score += 1; reasons_up.append("SMI")
-    else: score -= 1; reasons_down.append("SMI")
-    if curr['ADX'] > 25:
-        if curr['+DI'] > curr['-DI']: score += 2; reasons_up.append("ADX(Strong UP)")
-        else: score -= 2; reasons_down.append("ADX(Strong DOWN)")
+    # ==========================================
+    # LOGIKA 2: STOCHASTIC CROSSOVER KHUSUS
+    # Hanya kirim sinyal jika K memotong D di area <20 atau >80
+    # ==========================================
+    # Sell Cross: %K memotong ke bawah %D SAAT berada di area overbought (>80)
+    stoch_sell = (prev['STOCH_K'] > prev['STOCH_D']) and (curr['STOCH_K'] < curr['STOCH_D']) and (curr['STOCH_K'] > 80)
+    
+    # Buy Cross: %K memotong ke atas %D SAAT berada di area oversold (<20)
+    stoch_buy = (prev['STOCH_K'] < prev['STOCH_D']) and (curr['STOCH_K'] > curr['STOCH_D']) and (curr['STOCH_K'] < 20)
 
-    # [BARU] Logika Mode Ketat (Filter Sinyal Labil)
-    if score > threshold_adjustment: 
-        final_dir = "UP"
-    elif score < -threshold_adjustment: 
-        final_dir = "DOWN"
-    else: 
-        final_dir = "NETRAL" # Skor tidak cukup kuat untuk menebak
+    # ==========================================
+    # HIERARKI SINYAL TELEGRAM
+    # ==========================================
+    # 1. BERSAMAAN (Sangat Kuat)
+    if bbma_sell and stoch_sell:
+        return "PERFECT SELL (Extreme BBMA + Stoch Cross >80) 🌟🔴", "DOWN"
+    elif bbma_buy and stoch_buy:
+        return "PERFECT BUY (Extreme BBMA + Stoch Cross <20) 🌟🟢", "UP"
+        
+    # 2. BBMA EXTREME SAJA
+    elif bbma_sell:
+        return "EXTREME SELL (MA5 Keluar Top BB) ⚠️🔴", "DOWN"
+    elif bbma_buy:
+        return "EXTREME BUY (MA5 Keluar Low BB) ⚠️🟢", "UP"
+        
+    # 3. STOCHASTIC CROSSOVER SAJA (Sesuai Aturan Ketat Anda)
+    elif stoch_sell:
+        return "STOCH SELL (Garis %K Memotong %D ke Bawah di >80) 📉🔴", "DOWN"
+    elif stoch_buy:
+        return "STOCH BUY (Garis %K Memotong %D ke Atas di <20) 📈🟢", "UP"
 
-    return {
-        'score': score, 'final_dir': final_dir,
-        'up_votes': len(reasons_up), 'down_votes': len(reasons_down),
-        'details_up': ", ".join(reasons_up), 'details_down': ", ".join(reasons_down)
-    }
+    return setup_name, direction
 
 def evaluate_past_prediction(symbol, tf, closed_candle, past_prediction):
     actual_dir = "UP 🟢" if closed_candle['close'] > closed_candle['open'] else "DOWN 🔴"
     pred_dir = past_prediction['pred_dir']
+    setup_name = past_prediction['setup_name']
     
-    # Jika Sinyal sebelumnya NETRAL (Wait & See), lewati evaluasi
-    if pred_dir == "NETRAL":
-        return f"<b>📊 EVALUASI {symbol} ({tf})</b>\nSinyal Sebelumnya: WAIT & SEE ⚪ (Dilewati)"
-
     pred_dir_icon = "UP 🟢" if pred_dir == "UP" else "DOWN 🔴"
-    eval_text = f"<b>📊 EVALUASI {symbol} ({tf})</b>\nCandle Tutup: {actual_dir} | Prediksi Bot: {pred_dir_icon}\n"
+    
+    eval_text = f"<b>📊 EVALUASI {symbol} ({tf})</b>\nSetup: {setup_name}\nCandle Tutup: {actual_dir} | Prediksi Bot: {pred_dir_icon}\n"
 
     with stats_lock:
         if (actual_dir == "UP 🟢" and pred_dir == "UP") or (actual_dir == "DOWN 🔴" and pred_dir == "DOWN"):
             performance_stats[tf]['benar'] += 1
-            recent_accuracy[tf].append(1) # Simpan sejarah "Benar"
-            eval_text += "✅ <b>Hasil: BENAR</b>."
-        else:
-            performance_stats[tf]['salah'] += 1
-            recent_accuracy[tf].append(0) # Simpan sejarah "Salah"
-            
-            body_size = abs(closed_candle['close'] - closed_candle['open'])
-            up_w = closed_candle['high'] - max(closed_candle['open'], closed_candle['close'])
-            dn_w = min(closed_candle['open'], closed_candle['close']) - closed_candle['low']
-            vol_spike = closed_candle['volume'] > (closed_candle['AVG_VOL'] * 1.5)
-            
-            eval_text += "❌ <b>Hasil: SALAH</b>. Penyebab:\n"
-            if pred_dir == "UP" and "DOWN" in actual_dir:
-                if vol_spike: eval_text += "👉 Volume Jual Dadakan (Paus buang barang).\n"
-                elif up_w > body_size: eval_text += "👉 Gagal tembus resistensi (Jarum atas).\n"
-                else: eval_text += "👉 Momentum memudar mendadak.\n"
-            elif pred_dir == "DOWN" and "UP" in actual_dir:
-                if vol_spike: eval_text += "👉 Volume Beli Dadakan (Paus serok).\n"
-                elif dn_w > body_size: eval_text += "👉 Gagal tembus support (Jarum bawah).\n"
-                else: eval_text += "👉 Terjadi teknikal pantulan mendadak.\n"
+            return eval_text + "✅ <b>Hasil: BENAR</b>. (Reversal/Crossover Valid!)"
 
-        # Membatasi memori 10 trade terakhir
-        if len(recent_accuracy[tf]) > 10:
-            recent_accuracy[tf].pop(0)
-
-        # [BARU] EVALUASI DIRI (SELF-CORRECTION AI)
-        if len(recent_accuracy[tf]) >= 5: # Evaluasi mulai jalan setelah 5 trade
-            acc_rate = sum(recent_accuracy[tf]) / len(recent_accuracy[tf])
-            
-            if acc_rate < 0.60: # Jika akurasi anjlok di bawah 60%
-                # Bot menaikkan standar skoringnya (+1 lebih ketat)
-                dynamic_thresholds[tf] = min(6, dynamic_thresholds[tf] + 1)
-                eval_text += f"\n\n⚠️ <i>AI Menganalisa Akurasi Turun ({acc_rate*100:.0f}%). Standar Filter Ditingkatkan (+{dynamic_thresholds[tf]})!</i>"
-            elif acc_rate >= 0.75: # Jika akurasi sangat bagus
-                # Bot sedikit melonggarkan standarnya agar lebih banyak sinyal masuk
-                if dynamic_thresholds[tf] > 0:
-                    dynamic_thresholds[tf] -= 1
-                    eval_text += f"\n\n✨ <i>Akurasi Membaik ({acc_rate*100:.0f}%). Standar Filter Dinormalkan.</i>"
+        performance_stats[tf]['salah'] += 1
+        
+        body_size = abs(closed_candle['close'] - closed_candle['open'])
+        up_w = closed_candle['high'] - max(closed_candle['open'], closed_candle['close'])
+        dn_w = min(closed_candle['open'], closed_candle['close']) - closed_candle['low']
+        vol_spike = closed_candle['volume'] > (closed_candle['AVG_VOL'] * 1.5)
+        
+        eval_text += "❌ <b>Hasil: SALAH</b>. Penyebab Analisa Gagal:\n"
+        if pred_dir == "UP" and "DOWN" in actual_dir:
+            if vol_spike: eval_text += "👉 Panic Sell merusak struktur Reversal.\n"
+            else: eval_text += "👉 False Signal: Momentum turun masih kuat, setup batal.\n"
+        elif pred_dir == "DOWN" and "UP" in actual_dir:
+            if vol_spike: eval_text += "👉 Whale Buying (Paus) merusak struktur Reversal.\n"
+            else: eval_text += "👉 False Signal: Momentum naik masih kuat, setup batal.\n"
 
     return eval_text
 
@@ -277,63 +187,60 @@ def process_data(symbol, tf):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=LIMIT)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df = calculate_indicators(df)
+        df = calculate_reversal_indicators(df)
+        df = df.dropna().reset_index(drop=True)
         
         current_candle = df.iloc[-1]
         closed_candle = df.iloc[-2]
+        
         open_price = current_candle['open']
         current_price = current_candle['close']
         
-        # Ambil threshold terkini dari sistem AI
-        current_threshold = dynamic_thresholds[tf]
+        setup_name, pred_dir = detect_reversal_setup(current_candle, closed_candle)
         
-        master_analysis = generate_master_score(df, current_threshold)
-        pred_dir = master_analysis['final_dir']
-        score = master_analysis['score']
-        
-        if pred_dir == "UP":
-            if score >= 5: candle_status = "STRONG UP 🚀"
-            else: candle_status = "UP 🟢"
-        elif pred_dir == "DOWN":
-            if score <= -5: candle_status = "STRONG DOWN ☄️"
-            else: candle_status = "DOWN 🔴"
-        else:
-            candle_status = "WAIT & SEE ⚪ (Konsolidasi/Labil)"
-
-        bbma_setup = analyze_bbma(df)
         eval_result_text = ""
         
+        # --------------------------------------------------------
+        # KIRIM SINYAL HANYA JIKA ADA SETUP BBMA EXTREME / STOCH CROSSOVER
+        # --------------------------------------------------------
         if last_signaled_candle[symbol][tf] != current_candle['timestamp']:
             telegram_message = ""
+            
             past_pred = locked_predictions[symbol][tf]
             if past_pred is not None and past_pred['timestamp'] == closed_candle['timestamp']:
                 eval_result = evaluate_past_prediction(symbol, tf, closed_candle, past_pred)
                 telegram_message += eval_result + "\n\n"
                 eval_result_text = f"\n{eval_result.replace('<b>', '').replace('</b>', '')}"
-                
-            telegram_message += f"<b>🔮 SINYAL {symbol} ({tf})</b>\n"
-            
-            # Tampilan Peringatan Mode di Telegram
-            if current_threshold > 0:
-                telegram_message += f"🛡️ <b>Mode Ketat Aktif</b> (Filter: +{current_threshold})\n"
-            
-            telegram_message += f"Prediksi Arah: <b>{candle_status}</b>\n"
-            telegram_message += f"Skor Indikator: {score} poin\n\n"
             
             if pred_dir != "NETRAL":
-                telegram_message += f"✅ <b>Pendukung NAIK ({master_analysis['up_votes']}):</b>\n{master_analysis['details_up']}\n\n"
-                telegram_message += f"❌ <b>Pendukung TURUN ({master_analysis['down_votes']}):</b>\n{master_analysis['details_down']}\n\n"
-            
-            telegram_message += f"<b>Setup BBMA: {bbma_setup}</b>\n"
-            
-            send_telegram_message(telegram_message)
-            
-            locked_predictions[symbol][tf] = {
-                'timestamp': current_candle['timestamp'],
-                'pred_dir': pred_dir
-            }
+                telegram_message += f"<b>🚨 SETUP REVERSAL DITEMUKAN: {symbol} ({tf})</b>\n"
+                telegram_message += f"Harga Saat Ini: ${current_price:.4f}\n"
+                telegram_message += f"Sinyal Setup: <b>{setup_name}</b>\n"
+                telegram_message += f"Aksi Direkomendasikan: <b>{'BUY 🟢' if pred_dir == 'UP' else 'SELL 🔴'}</b>\n\n"
+                
+                # Tentukan status Stoch untuk tampilan Telegram
+                stoch_status = "OVERBOUGHT (>80)" if current_candle['STOCH_K'] > 80 else ("OVERSOLD (<20)" if current_candle['STOCH_K'] < 20 else "NETRAL")
+
+                telegram_message += "<i>Data Konfirmasi:</i>\n"
+                telegram_message += f"• Stoch %K(5,3): {current_candle['STOCH_K']:.1f}\n"
+                telegram_message += f"• Stoch %D(3): {current_candle['STOCH_D']:.1f}\n"
+                telegram_message += f"• Status Stoch: {stoch_status}\n"
+                telegram_message += f"• Top BB: ${current_candle['TOP_BB']:.2f}\n"
+                telegram_message += f"• Low BB: ${current_candle['LOW_BB']:.2f}\n"
+                
+                send_telegram_message(telegram_message)
+                
+                locked_predictions[symbol][tf] = {
+                    'timestamp': current_candle['timestamp'],
+                    'pred_dir': pred_dir,
+                    'setup_name': setup_name
+                }
+            else:
+                locked_predictions[symbol][tf] = None
+
             last_signaled_candle[symbol][tf] = current_candle['timestamp']
 
+        # Tampilan Terminal Lokal
         price_diff = current_price - open_price
         diff_sym = "+" if price_diff >= 0 else ""
         
@@ -342,8 +249,8 @@ def process_data(symbol, tf):
             terminal_output += eval_result_text + "\n"
         terminal_output += f"\n🪙 {symbol} [{tf}]"
         terminal_output += f"\n  Open: ${open_price:.4f} | Now: ${current_price:.4f} ({diff_sym}{price_diff:.4f})"
-        terminal_output += f"\n       ► Consensus   : {candle_status} (Skor: {score})"
-        terminal_output += f"\n       ► Setup BBMA  : {bbma_setup}"
+        terminal_output += f"\n       ► Status Reversal : {setup_name}"
+        terminal_output += f"\n       ► Stoch %K: {current_candle['STOCH_K']:.1f} | %D: {current_candle['STOCH_D']:.1f}"
 
         with print_lock:
             print(terminal_output)
@@ -353,13 +260,13 @@ def process_data(symbol, tf):
             print(f"\n🪙 {symbol} [{tf}] ⚠️ Error: {e}")
 
 # ==========================================
-# BACKTEST 1 MINGGU DENGAN AI ADAPTIF (60-80%)
+# BACKTEST 1 MINGGU KHUSUS SETUP REVERSAL
 # ==========================================
 def run_backtest():
     print("\n⏳ MENGAMBIL DATA 1 MINGGU KE BELAKANG UNTUK BACKTEST...")
-    print("Sistem Self-Correction AI akan aktif selama simulasi...\n")
+    print("Mencari momen BBMA Extreme & Stochastic Crossover (<20 / >80)...\n")
     
-    send_telegram_message("⏳ <b>Proses Backtest Adaptive Dimulai...</b>\nMensimulasikan data BTC/USDT 1 minggu terakhir dengan fitur koreksi otomatis.")
+    send_telegram_message("⏳ <b>Proses Backtest Reversal Dimulai...</b>\nMencari semua setup Extreme BBMA & Stochastic Crossover BTC/USDT selama 1 minggu terakhir.")
     
     days = 7
     now_ms = exchange.milliseconds()
@@ -368,7 +275,7 @@ def run_backtest():
     results = []
 
     for tf in TIMEFRAMES:
-        print(f"🔄 Mengunduh & Menganalisis Timeframe {tf}...")
+        print(f"🔄 Menganalisis Timeframe {tf}...")
         all_ohlcv = []
         since = start_ms
         
@@ -386,86 +293,40 @@ def run_backtest():
         if not all_ohlcv: continue
         
         df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df = calculate_indicators(df)
+        df = calculate_reversal_indicators(df)
         df = df.dropna().reset_index(drop=True)
         
         benar = 0
         salah = 0
-        
-        # Variabel Memori AI Khusus Backtest
-        bt_history = []
-        bt_threshold = 0 
 
         for i in range(1, len(df)):
             curr = df.iloc[i-1] 
             prev = df.iloc[i-2] if i >= 2 else curr
             
-            score = 0
-            if curr['close'] > curr['open']: score += 1
-            else: score -= 1
-            if curr['EMA_9'] > curr['EMA_21']: score += 1
-            else: score -= 1
-            if curr['MACD'] > curr['MACD_SIGNAL']: score += 1
-            else: score -= 1
-            if curr['RSI'] < 30: score += 2
-            elif curr['RSI'] > 70: score -= 2
-            elif curr['RSI'] > 50: score += 1
-            else: score -= 1
-            if curr['STOCH_K'] > curr['STOCH_D']:
-                if curr['STOCH_K'] < 20: score += 2
-                else: score += 1
-            else:
-                if curr['STOCH_K'] > 80: score -= 2
-                else: score -= 1
-            if curr['OBV'] > prev['OBV']: score += 1
-            else: score -= 1
-            if curr['CMF'] > 0: score += 1
-            else: score -= 1
-            if curr['SMI'] > curr['SMI_SIGNAL']: score += 1
-            else: score -= 1
-            if curr['ADX'] > 25:
-                if curr['+DI'] > curr['-DI']: score += 2
-                else: score -= 2
+            setup_name, pred_dir = detect_reversal_setup(curr, prev)
 
-            # Terapkan Threshold AI
-            if score > bt_threshold: pred_dir = "UP"
-            elif score < -bt_threshold: pred_dir = "DOWN"
-            else: pred_dir = "NETRAL"
-
-            actual_dir = "UP" if df.iloc[i]['close'] > df.iloc[i]['open'] else "DOWN"
-            
-            # Catat & Evaluasi AI (Hanya jika bot berani menebak)
             if pred_dir != "NETRAL":
+                actual_dir = "UP" if df.iloc[i]['close'] > df.iloc[i]['open'] else "DOWN"
                 if pred_dir == actual_dir:
                     benar += 1
-                    bt_history.append(1)
                 else:
                     salah += 1
-                    bt_history.append(0)
-                    
-                if len(bt_history) > 10: bt_history.pop(0)
-                
-                # Fitur Adaptif Aktif di masa lalu
-                if len(bt_history) == 10:
-                    acc = sum(bt_history) / 10
-                    if acc < 0.60: bt_threshold = min(5, bt_threshold + 1)
-                    elif acc > 0.75: bt_threshold = max(0, bt_threshold - 1)
                 
         total = benar + salah
         akurasi = (benar / total * 100) if total > 0 else 0
         results.append((tf, total, benar, salah, akurasi))
 
-    telegram_msg = "<b>📊 HASIL BACKTEST ADAPTIF (1 MINGGU) 📊</b>\n"
-    telegram_msg += "Filter AI Otomatis (Target 60-80%)\n"
+    telegram_msg = "<b>📊 HASIL BACKTEST REVERSAL (1 MINGGU) 📊</b>\n"
+    telegram_msg += "Filter: Extreme BBMA & Stoch Cross (<20 / >80)\n"
     telegram_msg += "<pre>\n"
     telegram_msg += f"{'TF':<4} | {'TOT':<4} | {'BNR':<4} | {'SLH':<4} | {'AKURASI':<7}\n"
     telegram_msg += "-" * 33 + "\n"
     
     print("\n=======================================================================")
-    print("📊 HASIL BACKTEST ADAPTIF 1 MINGGU (TARGET: 60-80%)")
+    print("📊 HASIL BACKTEST REVERSAL (EXTREME BBMA + STOCH CROSSOVER)")
     print("=======================================================================")
-    print(f"{'TIMEFRAME':<10} | {'TOTAL TEBAKAN':<13} | {'BENAR':<8} | {'SALAH':<8} | {'AKURASI':<8}")
-    print("-" * 71)
+    print(f"{'TIMEFRAME':<10} | {'TOTAL SETUP':<13} | {'BENAR':<8} | {'SALAH':<8} | {'AKURASI':<8}")
+    print("-" * 69)
     
     total_semua = benar_semua = salah_semua = 0
 
@@ -485,17 +346,17 @@ def run_backtest():
 
 def run_bot():
     print("\n======================================================")
-    print("🚀 MENJALANKAN BOT REAL-TIME (Tekan Ctrl+C untuk Stop)")
+    print("🚀 MENJALANKAN BOT REVERSAL (Tekan Ctrl+C untuk Stop)")
     print("======================================================\n")
 
-    send_telegram_message("🤖 <b>Bot Adaptive AI Dimulai!</b>\nJika akurasi turun <60%, bot otomatis mengubah mode jadi KETAT (Filter Sinyal Labil).")
+    send_telegram_message("🤖 <b>Bot Final Reversal Dimulai!</b>\nHanya mengirim sinyal saat terjadi BBMA Extreme ATAU Stochastic Crossover murni di area Overbought/Oversold.")
     global last_report_time
     last_report_time = datetime.now() 
 
     try:
         while True:
             print(f"\n======================================================")
-            print(f"🔄 Memantau BTC dengan AI Dinamis: {datetime.now().strftime('%H:%M:%S')}")
+            print(f"🔄 Mencari Pola Reversal Valid: {datetime.now().strftime('%H:%M:%S')}")
             print(f"======================================================")
             
             with concurrent.futures.ThreadPoolExecutor(max_workers=len(SYMBOLS)*len(TIMEFRAMES)) as executor:
@@ -516,10 +377,10 @@ def main_menu():
     while True:
         os.system('cls' if os.name == 'nt' else 'clear') 
         print("======================================================")
-        print("🌟 MENU UTAMA BOT CRYPTO ADAPTIVE AI 🌟")
+        print("🌟 MENU UTAMA BOT CRYPTO REVERSAL FINAL 🌟")
         print("======================================================")
-        print("1. 🚀 Jalankan Prediksi Real-Time (Fitur AI 60-80%)")
-        print("2. 📊 Analisis Masa Lalu (Backtest AI 1 Minggu Kebelakang)")
+        print("1. 🚀 Jalankan Pendeteksi BBMA Extreme & Stoch Crossover")
+        print("2. 📊 Analisis Backtest 1 Minggu Kebelakang")
         print("3. ❌ Keluar / Matikan Program")
         print("======================================================")
         
