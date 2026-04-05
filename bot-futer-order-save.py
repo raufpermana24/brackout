@@ -184,7 +184,7 @@ def start_websocket_thread():
     threading.Thread(target=lambda: ws.run_forever(), daemon=True).start()
 
 # ==========================================
-# FUNGSI TELEGRAM (ON-DEMAND POLLING DENGAN DEBUG)
+# FUNGSI TELEGRAM (ON-DEMAND POLLING DENGAN FIX CHANNEL)
 # ==========================================
 def send_telegram_message(message, target_chat_id=None):
     chat = target_chat_id if target_chat_id else TELEGRAM_CHAT_ID
@@ -231,7 +231,7 @@ def format_setup_table(tf_request):
 def telegram_polling_thread():
     offset = None
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    print("📡 Bot Pendengar Telegram Aktif. Menunggu perintah user...")
+    print("📡 Bot Pendengar Telegram Aktif. Menunggu perintah user di Grup/Channel...")
     
     while True:
         try:
@@ -243,22 +243,31 @@ def telegram_polling_thread():
                 for update in response['result']:
                     offset = update['update_id'] + 1
                     
-                    if 'message' in update and 'text' in update['message']:
-                        chat_id = update['message']['chat']['id']
-                        text = update['message']['text'].strip().lower()
+                    # [BARU] Mendukung Pesan dari Grup (message) ATAU dari Channel (channel_post)
+                    msg_data = None
+                    if 'message' in update:
+                        msg_data = update['message']
+                    elif 'channel_post' in update:
+                        msg_data = update['channel_post']
+                    
+                    if msg_data and 'text' in msg_data:
+                        chat_id = msg_data['chat']['id']
+                        text = msg_data['text'].strip().lower()
 
                         # --- LOG DEBUGGING KE TERMINAL ---
+                        chat_type = msg_data['chat'].get('type', 'unknown')
                         with print_lock:
-                            print(f"\n📩 Pesan Telegram Diterima: '{text}' (Chat ID: {chat_id})")
+                            print(f"\n📩 Pesan {chat_type} Diterima: '{text}' (Chat ID: {chat_id})")
 
                         # Mengecek perintah (Bisa membedakan /5m atau 5m)
                         tf_cmd = text.replace('/', '')
                         if tf_cmd in TIMEFRAMES:
-                            with print_lock: print(f"✅ Mengeksekusi permintaan data tabel {tf_cmd}...")
+                            with print_lock: print(f"✅ Mengeksekusi permintaan tabel {tf_cmd} ke Chat {chat_id}...")
                             reply_msg = format_setup_table(tf_cmd)
                             send_telegram_message(reply_msg, target_chat_id=chat_id)
                         else:
                             with print_lock: print(f"ℹ️ Pesan diabaikan (Bukan perintah timeframe valid).")
+                            
         except requests.exceptions.ReadTimeout:
             pass # Timeout wajar pada Long Polling Telegram
         except Exception as e:
@@ -509,7 +518,7 @@ def run_bot():
     start_websocket_thread()
     threading.Thread(target=telegram_polling_thread, daemon=True).start()
 
-    send_telegram_message(f"🤖 <b>Bot Ultimate (VPS Mode) Siap!</b>\nMengumpulkan data {len(SYMBOLS)} koin secara diam-diam. Data VPS otomatis dihapus per 2 Hari.\n\nKetik <b>/5m</b>, <b>/1h</b>, atau <b>/4h</b> untuk melihat Daftar Koin yang berpotensi.")
+    send_telegram_message(f"🤖 <b>Bot Ultimate (VPS Mode) Siap!</b>\nMengumpulkan data {len(SYMBOLS)} koin secara diam-diam. Data VPS otomatis dihapus per 2 Hari.\n\nKetik <b>/5m</b>, <b>/1h</b>, atau <b>/4h</b> di Saluran (Channel) atau Grup untuk melihat Daftar Koin yang berpotensi.")
     
     global last_report_time
     last_report_time = datetime.now() 
