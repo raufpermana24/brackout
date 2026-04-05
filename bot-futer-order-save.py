@@ -9,7 +9,7 @@ import concurrent.futures
 import threading
 import json
 import websocket # Membutuhkan: pip install websocket-client
-import copy      # Untuk duplikasi data memori ke VPS
+import copy      
 
 # ==========================================
 # KREDENSIAL API & TELEGRAM
@@ -24,7 +24,7 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003812500986')
 # ==========================================
 TIMEFRAMES = ['5m', '1h', '4h'] 
 LIMIT = 100 
-DATA_DIR = "vps_data" # Folder penyimpanan lokal di VPS
+DATA_DIR = "vps_data" 
 
 exchange = ccxt.binance({
     'apiKey': BINANCE_API_KEY,
@@ -89,9 +89,9 @@ def manage_vps_storage():
 
 def load_vps_data():
     global performance_stats, locked_predictions, last_signaled_candle, shared_ohlcv, active_setups
-    if not os.path.exists(DATA_DIR): return
+    if not os.path.exists(DATA_DIR): return False
     files = [os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR) if f.endswith('.json')]
-    if not files: return
+    if not files: return False
 
     latest_file = max(files, key=os.path.getctime)
     print(f"🔄 Memulihkan data memori dari VPS: {latest_file}...")
@@ -114,8 +114,10 @@ def load_vps_data():
                     last_signaled_candle[sym] = state["last_signaled_candle"][sym]
                     
         print("✅ Pemulihan VPS selesai! Bot tidak perlu mengulang dari nol.")
+        return True
     except Exception as e:
         print(f"⚠️ Gagal memulihkan data: {e}")
+        return False
 
 def get_all_usdt_futures():
     print("⏳ Mengambil daftar semua market USDT Futures aktif...")
@@ -142,7 +144,7 @@ def initialize_memory():
         ccxt_to_ws_sym[sym] = ws_sym
         ws_to_ccxt_sym[ws_sym] = sym
         
-    load_vps_data()
+    return load_vps_data()
 
 # ==========================================
 # ENGINE WEBSOCKET HYBRID
@@ -184,7 +186,7 @@ def start_websocket_thread():
     threading.Thread(target=lambda: ws.run_forever(), daemon=True).start()
 
 # ==========================================
-# FUNGSI TELEGRAM (ON-DEMAND POLLING DENGAN FIX CHANNEL)
+# FUNGSI TELEGRAM (ON-DEMAND POLLING DENGAN SUMMARY MENU)
 # ==========================================
 def send_telegram_message(message, target_chat_id=None):
     chat = target_chat_id if target_chat_id else TELEGRAM_CHAT_ID
@@ -193,6 +195,25 @@ def send_telegram_message(message, target_chat_id=None):
     try: requests.post(url, json=payload, timeout=10)
     except Exception as e: 
         with print_lock: print(f"⚠️ Gagal kirim ke Telegram: {e}")
+
+def get_summary_message():
+    """Menghasilkan teks laporan jumlah koin per timeframe"""
+    msg = "<b>📢 HASIL PEMINDAIAN PASAR SAAT INI</b>\n\n"
+    msg += "Bot telah mengumpulkan data terbaru. Berikut jumlah koin yang memiliki setup aktif:\n\n"
+    
+    total_signals = 0
+    for tf in TIMEFRAMES:
+        count = len(active_setups.get(tf, {}))
+        total_signals += count
+        msg += f"🕒 Timeframe <b>{tf}</b> : Terdapat <b>{count} Sinyal</b>\n"
+    
+    msg += "\n<i>👉 Silakan balas/ketik timeframe yang ingin Anda lihat (contoh: <b>/5m</b>, <b>/1h</b>, atau <b>/4h</b>)</i>\n"
+    msg += "<i>👉 Ketik <b>/status</b> kapan saja untuk melihat menu ini lagi.</i>"
+    
+    if total_signals == 0:
+        msg += "\n\n⚠️ <i>Pasar sedang konsolidasi, belum ada setup valid ditemukan.</i>"
+        
+    return msg
 
 def format_setup_table(tf_request):
     setups = active_setups.get(tf_request, {})
@@ -203,7 +224,11 @@ def format_setup_table(tf_request):
     text += f"{'KOIN':<8} | {'DIR':<4} | {'PAUS':<4} | {'SETUP'}\n"
     text += "-" * 34 + "\n"
 
-    for sym, data in setups.items():
+    # Urutkan berdasarkan Abjad Koin agar rapi
+    sorted_syms = sorted(setups.keys())
+    
+    for sym in sorted_syms:
+        data = setups[sym]
         clean_sym = sym.split('/')[0] 
         if len(clean_sym) > 8: clean_sym = clean_sym[:8]
 
@@ -225,7 +250,7 @@ def format_setup_table(tf_request):
 
         text += f"{clean_sym:<8} | {dir_str:<4} |  {whale_str}  | {s_name}\n"
 
-    text += "</pre>\n<i>Keterangan PAUS (Order Book):\n🟢 = Dominan Beli | 🔴 = Dominan Jual</i>"
+    text += "</pre>\n<i>Keterangan PAUS:\n🟢 = Dominan Beli | 🔴 = Dominan Jual</i>"
     return text
 
 def telegram_polling_thread():
@@ -243,33 +268,36 @@ def telegram_polling_thread():
                 for update in response['result']:
                     offset = update['update_id'] + 1
                     
-                    # [BARU] Mendukung Pesan dari Grup (message) ATAU dari Channel (channel_post)
                     msg_data = None
-                    if 'message' in update:
-                        msg_data = update['message']
-                    elif 'channel_post' in update:
-                        msg_data = update['channel_post']
+                    if 'message' in update: msg_data = update['message']
+                    elif 'channel_post' in update: msg_data = update['channel_post']
                     
                     if msg_data and 'text' in msg_data:
                         chat_id = msg_data['chat']['id']
                         text = msg_data['text'].strip().lower()
 
-                        # --- LOG DEBUGGING KE TERMINAL ---
                         chat_type = msg_data['chat'].get('type', 'unknown')
                         with print_lock:
                             print(f"\n📩 Pesan {chat_type} Diterima: '{text}' (Chat ID: {chat_id})")
 
-                        # Mengecek perintah (Bisa membedakan /5m atau 5m)
+                        # Cek Command Menu (Summary)
+                        if 'status' in text or 'menu' in text or 'scan' in text:
+                            with print_lock: print(f"✅ Mengirim Ringkasan (Status) ke Chat {chat_id}...")
+                            reply_msg = get_summary_message()
+                            send_telegram_message(reply_msg, target_chat_id=chat_id)
+                            continue
+
+                        # Cek Command Tabel Timeframe
                         tf_cmd = text.replace('/', '')
                         if tf_cmd in TIMEFRAMES:
                             with print_lock: print(f"✅ Mengeksekusi permintaan tabel {tf_cmd} ke Chat {chat_id}...")
                             reply_msg = format_setup_table(tf_cmd)
                             send_telegram_message(reply_msg, target_chat_id=chat_id)
                         else:
-                            with print_lock: print(f"ℹ️ Pesan diabaikan (Bukan perintah timeframe valid).")
+                            with print_lock: print(f"ℹ️ Pesan diabaikan (Bukan perintah valid).")
                             
         except requests.exceptions.ReadTimeout:
-            pass # Timeout wajar pada Long Polling Telegram
+            pass 
         except Exception as e:
             with print_lock: print(f"⚠️ Telegram Polling Error: {e}")
             time.sleep(2)
@@ -438,10 +466,33 @@ def process_data(symbol, tf):
     except Exception: pass
 
 # ==========================================
+# [BARU] FUNGSI PEMINDAIAN MASSAL AWAL (MASS SCAN)
+# ==========================================
+def initial_mass_scan():
+    """Memindai seluruh 200+ koin pada saat bot dinyalakan sebelum masuk ke mode background"""
+    print("\n🔍 Memulai Pemindaian Massal (Mass Scan) seluruh koin. Proses ini memakan waktu 1-2 Menit...")
+    send_telegram_message("⏳ <b>Menyiapkan Database Market...</b>\nBot sedang memindai seluruh 200+ koin Futures. Mohon tunggu sekitar 1-2 menit...")
+    
+    # Gunakan ThreadPool untuk mempercepat download REST API secara paralel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        futures = [executor.submit(process_data, sym, tf) for sym in SYMBOLS for tf in TIMEFRAMES]
+        # Tampilkan progress bar sederhana di terminal
+        total = len(futures)
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
+            if i % 50 == 0:
+                print(f"   [Progress: {i}/{total} Tugas Selesai...]")
+                
+    print("✅ Mass Scan Selesai! Mengirim Laporan Ringkasan ke Telegram...")
+    
+    # Setelah scan selesai, kirim laporan summary
+    summary_msg = get_summary_message()
+    send_telegram_message(summary_msg)
+
+# ==========================================
 # BACKTEST 
 # ==========================================
 def run_backtest():
-    initialize_memory()
+    is_restored = initialize_memory()
     print("\n⏳ MENGAMBIL DATA 1 MINGGU KE BELAKANG UNTUK BACKTEST...")
     send_telegram_message("⏳ <b>Proses Backtest Dimulai...</b>\nMensimulasikan Top 10 Koin Futures selama 1 minggu terakhir.")
     
@@ -510,21 +561,28 @@ def run_backtest():
     input("Tekan [ENTER] untuk kembali ke Menu Utama...")
 
 def run_bot():
-    initialize_memory()
+    is_restored = initialize_memory()
     print("\n======================================================")
-    print("🚀 MENJALANKAN BOT VPS DAEMON (SILENT & AUTO-BACKUP)")
+    print("🚀 MENJALANKAN BOT VPS DAEMON (AUTO-SCAN & BACKGROUND)")
     print("======================================================\n")
 
+    # Jalankan Pemindaian Massal dulu (Hanya jika bot dinyalakan ulang dari nol)
+    if not is_restored:
+        initial_mass_scan()
+    else:
+        send_telegram_message("🤖 <b>Bot Berhasil Direstart!</b>\nData dari VPS sukses dipulihkan. Ketik <b>/status</b> untuk melihat ringkasan pasar.")
+
+    # Mulai menyedot data live tanpa henti
     start_websocket_thread()
+    # Mulai menunggu perintah chat dari Telegram
     threading.Thread(target=telegram_polling_thread, daemon=True).start()
 
-    send_telegram_message(f"🤖 <b>Bot Ultimate (VPS Mode) Siap!</b>\nMengumpulkan data {len(SYMBOLS)} koin secara diam-diam. Data VPS otomatis dihapus per 2 Hari.\n\nKetik <b>/5m</b>, <b>/1h</b>, atau <b>/4h</b> di Saluran (Channel) atau Grup untuk melihat Daftar Koin yang berpotensi.")
-    
     global last_report_time
     last_report_time = datetime.now() 
 
     try:
         while True:
+            # Perbarui kondisi setup semua koin setiap 5 detik di background
             with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
                 futures = [executor.submit(process_data, sym, tf) for sym in SYMBOLS for tf in TIMEFRAMES]
                 concurrent.futures.wait(futures)
@@ -546,9 +604,9 @@ def main_menu():
     while True:
         os.system('cls' if os.name == 'nt' else 'clear') 
         print("======================================================")
-        print("🌟 MENU UTAMA BOT VPS (AUTO-BACKUP & CLEANUP) 🌟")
+        print("🌟 MENU UTAMA BOT VPS (MASS SCAN & ON-DEMAND) 🌟")
         print("======================================================")
-        print("1. 🚀 Jalankan Pengumpul Data Background (VPS Daemon)")
+        print("1. 🚀 Jalankan Auto-Scan & Pengumpul Background")
         print("2. 📊 Analisis Backtest (Sampel 10 Koin)")
         print("3. ❌ Keluar / Matikan Program")
         print("======================================================")
