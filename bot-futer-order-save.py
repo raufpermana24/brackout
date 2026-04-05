@@ -12,6 +12,11 @@ import websocket # Membutuhkan: pip install websocket-client
 import copy
 import traceback 
 
+import matplotlib
+matplotlib.use('Agg') 
+import matplotlib.pyplot as plt
+import io
+
 # ==========================================
 # KREDENSIAL API & TELEGRAM
 # ==========================================
@@ -85,8 +90,7 @@ def manage_vps_storage():
     try:
         with open(save_path, "w") as f: json.dump(state_to_save, f)
         with print_lock: print(f"💾 Data berhasil dicadangkan ke VPS: {save_path}")
-    except Exception as e:
-        pass
+    except Exception as e: pass
 
 def load_vps_data():
     global performance_stats, locked_predictions, last_signaled_candle, shared_ohlcv, active_setups
@@ -106,14 +110,11 @@ def load_vps_data():
                     if tf in state["active_setups"]: active_setups[tf].update(state["active_setups"][tf])
 
             for sym in SYMBOLS:
-                if "shared_ohlcv" in state and sym in state["shared_ohlcv"]:
-                    shared_ohlcv[sym] = state["shared_ohlcv"][sym]
-                if "locked_predictions" in state and sym in state["locked_predictions"]:
-                    locked_predictions[sym] = state["locked_predictions"][sym]
-                if "last_signaled_candle" in state and sym in state["last_signaled_candle"]:
-                    last_signaled_candle[sym] = state["last_signaled_candle"][sym]
+                if "shared_ohlcv" in state and sym in state["shared_ohlcv"]: shared_ohlcv[sym] = state["shared_ohlcv"][sym]
+                if "locked_predictions" in state and sym in state["locked_predictions"]: locked_predictions[sym] = state["locked_predictions"][sym]
+                if "last_signaled_candle" in state and sym in state["last_signaled_candle"]: last_signaled_candle[sym] = state["last_signaled_candle"][sym]
                     
-        print("✅ Pemulihan VPS selesai! Bot tidak perlu mengulang dari nol.")
+        print("✅ Pemulihan VPS selesai!")
         return True
     except Exception as e:
         print(f"⚠️ Gagal memulihkan data: {e}")
@@ -183,90 +184,104 @@ def start_websocket_thread():
     threading.Thread(target=lambda: ws.run_forever(), daemon=True).start()
 
 # ==========================================
-# FUNGSI TELEGRAM
+# FUNGSI TELEGRAM & GRAFIK
 # ==========================================
 def send_telegram_message(message, target_chat_id=None):
     chat = target_chat_id if target_chat_id else TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": chat, "text": message, "parse_mode": "HTML"}
-    try: 
-        req = requests.post(url, json=payload, timeout=10)
-        if not req.ok:
-            with print_lock: print(f"⚠️ Telegram API Error (Send): {req.text}")
-    except Exception as e: 
-        with print_lock: print(f"⚠️ Gagal kirim koneksi ke Telegram: {e}")
+    try: requests.post(url, json=payload, timeout=10)
+    except Exception: pass
+
+def send_telegram_photo(caption, photo_buf, target_chat_id=None):
+    chat = target_chat_id if target_chat_id else TELEGRAM_CHAT_ID
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    files = {'photo': ('chart.png', photo_buf, 'image/png')}
+    data = {'chat_id': chat, 'caption': caption, 'parse_mode': 'HTML'}
+    try: requests.post(url, files=files, data=data, timeout=15)
+    except Exception: pass
+
+def generate_candlestick_chart(symbol, tf, df):
+    df_chart = df.tail(50).reset_index(drop=True)
+    fig, ax = plt.subplots(figsize=(8, 4), facecolor='#1e1e2f')
+    ax.set_facecolor('#1e1e2f')
+
+    up = df_chart[df_chart['close'] >= df_chart['open']]
+    down = df_chart[df_chart['close'] < df_chart['open']]
+    width, width2 = 0.6, 0.05
+
+    ax.bar(up.index, up['close'] - up['open'], width, bottom=up['open'], color='#00ff88', edgecolor='none')
+    ax.bar(up.index, up['high'] - up['low'], width2, bottom=up['low'], color='#00ff88', edgecolor='none')
+    ax.bar(down.index, down['close'] - down['open'], width, bottom=down['open'], color='#ff3366', edgecolor='none')
+    ax.bar(down.index, down['high'] - down['low'], width2, bottom=down['low'], color='#ff3366', edgecolor='none')
+
+    ax.plot(df_chart.index, df_chart['MA8_CLOSE'], color='#00d4ff', linewidth=1.5, label='MA 8')
+    ax.plot(df_chart.index, df_chart['MA13_CLOSE'], color='#ffaa00', linewidth=1.5, label='MA 13')
+
+    clean_sym = symbol.replace(':USDT', '')
+    ax.set_title(f"Grafik {clean_sym} ({tf}) - VIP Setup", color='white', fontsize=12)
+    ax.tick_params(colors='white')
+    ax.grid(color='#2a2a3f', linestyle='--', linewidth=0.5)
+    ax.legend(loc='upper left', facecolor='#1e1e2f', labelcolor='white', edgecolor='none')
+    plt.tight_layout()
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=100, facecolor=fig.get_facecolor(), edgecolor='none')
+    buf.seek(0)
+    plt.close(fig)
+    return buf
 
 def get_summary_message():
     msg = "<b>📢 HASIL PEMINDAIAN PASAR SAAT INI</b>\n\n"
-    msg += "Bot telah mengumpulkan data terbaru. Berikut jumlah koin yang memiliki setup aktif:\n\n"
+    msg += "Bot telah mengumpulkan data teknikal. (Sinyal akan difilter secara ketat saat Anda memintanya):\n\n"
     
-    total_signals = 0
     for tf in TIMEFRAMES:
         count = len(active_setups.get(tf, {}))
-        total_signals += count
-        msg += f"🕒 Timeframe <b>{tf}</b> : Terdapat <b>{count} Sinyal</b>\n"
+        msg += f"🕒 Timeframe <b>{tf}</b> : <b>{count} Koin Berpotensi</b>\n"
     
     msg += "\n<i>👉 Ketik timeframe yang ingin dianalisis (contoh: <b>/5m</b>, <b>/1h</b>)</i>\n"
-    msg += "<i>👉 Ketik <b>/status</b> untuk melihat menu ini lagi.</i>"
-    
-    if total_signals == 0:
-        msg += "\n\n⚠️ <i>Pasar sedang konsolidasi, belum ada setup valid ditemukan.</i>"
+    msg += "<i>Bot hanya akan mengirimkan sinyal VIP yang dikonfirmasi oleh Open Interest (OI) / Paus.</i>"
     return msg
 
-# ==========================================
-# [BARU] ANALISIS OPEN INTEREST (OI)
-# ==========================================
 def get_open_interest_analysis(symbol, tf, current_price, prev_price):
-    """Mengambil dan membandingkan data Open Interest secara real-time"""
     try:
-        # Merapikan symbol (Contoh: BTC/USDT:USDT -> BTCUSDT)
         clean_sym = symbol.split(':')[0].replace('/', '')
-        
-        # Menggunakan jalur langsung (Direct Request) agar bebas dari batasan library CCXT
         url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={clean_sym}&period={tf}&limit=2"
         res = requests.get(url, timeout=5).json()
         
         if len(res) >= 2:
             oi_prev = float(res[0]['sumOpenInterestValue'])
             oi_curr = float(res[1]['sumOpenInterestValue'])
-            
             oi_up = oi_curr > oi_prev
             price_up = current_price > prev_price
             
-            # Logika Open Interest + Harga Sesuai Standar Institusi
-            if oi_up and price_up:
-                return "🟢 Bullish Menguat (Modal Baru Masuk | OI ⬆️ & Harga ⬆️)"
-            elif oi_up and not price_up:
-                return "🔴 Bearish Menguat (Short Baru Masuk | OI ⬆️ & Harga ⬇️)"
-            elif not oi_up and price_up:
-                return "⚠️ Bullish Melemah (Posisi Long Ditutup | OI ⬇️ & Harga ⬆️)"
-            elif not oi_up and not price_up:
-                return "⚠️ Bearish Melemah (Short Covering | OI ⬇️ & Harga ⬇️)"
-                
-    except Exception as e:
-        pass
-    return "⚪ Data OI Tidak Tersedia"
+            if oi_up and price_up: return "🟢 Bullish Menguat (OI ⬆️ Harga ⬆️)", 2 # Skor 2 = Sangat Kuat LONG
+            elif oi_up and not price_up: return "🔴 Bearish Menguat (OI ⬆️ Harga ⬇️)", -2 # Skor -2 = Sangat Kuat SHORT
+            elif not oi_up and price_up: return "⚠️ Bullish Melemah (OI ⬇️ Harga ⬆️)", -1 # Fakeout
+            elif not oi_up and not price_up: return "⚠️ Bearish Melemah (OI ⬇️ Harga ⬇️)", 1 # Fakeout
+    except Exception: pass
+    return "⚪ Data OI Tidak Tersedia", 0
 
 def send_detailed_setups(chat_id, tf_request):
     setups = active_setups.get(tf_request, {})
     
     if not setups:
-        empty_msg = f"<b>📊 ANALISIS KOIN AKTIF ({tf_request})</b>\n\n<i>Kondisi Market: Sedang Konsolidasi.\nBelum ada koin dengan setup/sinyal yang valid saat ini.</i>"
+        empty_msg = f"<b>📊 ANALISIS KOIN AKTIF ({tf_request})</b>\n\n<i>Kondisi Market: Sedang Konsolidasi.\nBelum ada koin dengan setup valid.</i>"
         send_telegram_message(empty_msg, target_chat_id=chat_id)
         return
 
-    header = f"<b>📊 RINCIAN ANALISIS PER KOIN ({tf_request})</b>\nTotal: <b>{len(setups)} Peluang Ditemukan</b>\n\n"
-    messages_to_send = []
-    current_msg = header
+    send_telegram_message(f"⏳ <b>Memproses {len(setups)} sinyal mentah...</b>\nMenerapkan Smart Filter (Mencari konfirmasi Paus & Modal Baru OI). Proses ini memakan waktu beberapa detik...", chat_id)
 
     sorted_syms = sorted(setups.keys())
-    
+    vip_signals_to_send = []
+
+    # ==========================================
+    # LOGIKA SMART FILTER (SINYAL PENTING)
+    # ==========================================
     for sym in sorted_syms:
         data = setups[sym]
-        clean_sym = sym.split('/')[0] 
-        dir_icon = "🟢 LONG" if data['dir'] == "UP" else "🔴 SHORT"
         
-        # 1. Pengecekan Order Book (Paus)
+        # 1. Tarik Data OI dan Whale terlebih dahulu
         try:
             ob = exchange.fetch_order_book(sym, limit=20)
             bids, asks = ob['bids'], ob['asks']
@@ -274,36 +289,79 @@ def send_detailed_setups(chat_id, tf_request):
             total_ask = sum(a[1] for a in asks)
             tot = total_bid + total_ask
             buy_pct = (total_bid / tot) * 100 if tot > 0 else 50
-            if buy_pct > 60: whale_stat = f"🟢 Dominan Beli ({buy_pct:.0f}%)"
-            elif buy_pct < 40: whale_stat = f"🔴 Dominan Jual ({(100-buy_pct):.0f}%)"
-            else: whale_stat = f"⚪ Netral / Ragu-ragu ({buy_pct:.0f}% Beli)"
+            if buy_pct > 55: whale_stat, whale_score = f"🟢 Dominan Beli ({buy_pct:.0f}%)", 1
+            elif buy_pct < 45: whale_stat, whale_score = f"🔴 Dominan Jual ({(100-buy_pct):.0f}%)", -1
+            else: whale_stat, whale_score = f"⚪ Netral ({buy_pct:.0f}% Beli)", 0
         except:
-            whale_stat = "⚪ Data Paus Tidak Tersedia"
+            whale_stat, whale_score = "⚪ Data Paus Tidak Tersedia", 0
 
-        # 2. Pengecekan Open Interest (Analisis Arus Modal)
-        oi_stat = get_open_interest_analysis(sym, tf_request, data['price'], data['prev_price'])
+        oi_stat, oi_score = get_open_interest_analysis(sym, tf_request, data['price'], data['prev_price'])
 
-        coin_block = f"<b>🪙 {clean_sym}/USDT | {dir_icon}</b>\n"
-        coin_block += f"📝 <b>Sinyal:</b> {data['setup_name']}\n"
-        coin_block += f"🐋 <b>Order Book:</b> {whale_stat}\n"
-        coin_block += f"📊 <b>Open Interest:</b> {oi_stat}\n"
-        coin_block += f"📈 <b>Harga Saat Ini:</b> ${data['price']:.4f}\n"
-        coin_block += f"⚡ <b>Stoch K/D:</b> {data['stoch_k']:.1f} / {data['stoch_d']:.1f}\n"
-        coin_block += f"📏 <b>MA5/8/13:</b> ${data['ma5']:.4f} | ${data['ma8']:.4f} | ${data['ma13']:.4f}\n"
-        coin_block += "➖➖➖➖➖➖➖➖➖➖\n"
-
-        if len(current_msg) + len(coin_block) > 3800:
-            messages_to_send.append(current_msg)
-            current_msg = coin_block
+        # 2. Proses Filtrasi Sinyal (Penyaringan Sinyal Ampas)
+        is_important = False
+        dir_long = data['dir'] == "UP"
+        setup_name = data['setup_name']
+        
+        # Apakah ini setup papan atas? (Sangat Akurat)
+        is_super_setup = "PERFECT" in setup_name or "EXTREME" in setup_name or "TRIANGLE" in setup_name
+        
+        # Kondisi Filter untuk posisi LONG
+        if dir_long:
+            if is_super_setup and oi_score >= 0: 
+                is_important = True # Setup langka, dan OI tidak melemah
+            elif oi_score == 2: 
+                is_important = True # Teknikal biasa, tapi Bandar injek modal besar-besaran (Valid)
+            elif whale_score == 1 and ("CROSS" in setup_name or "STOCH" in setup_name) and oi_score >= 0:
+                is_important = True # Persilangan didukung tembok beli Paus (Valid)
+        # Kondisi Filter untuk posisi SHORT
         else:
-            current_msg += coin_block
+            if is_super_setup and oi_score <= 0:
+                is_important = True 
+            elif oi_score == -2:
+                is_important = True 
+            elif whale_score == -1 and ("CROSS" in setup_name or "STOCH" in setup_name) and oi_score <= 0:
+                is_important = True 
 
-    if current_msg:
-        messages_to_send.append(current_msg)
+        # Jika Lolos Filter, masukkan ke daftar kirim Telegram
+        if is_important:
+            clean_sym = sym.split('/')[0] 
+            dir_icon = "🟢 LONG" if dir_long else "🔴 SHORT"
+            
+            caption = f"<b>⭐ VIP SETUP: {clean_sym}/USDT | {dir_icon}</b>\n"
+            caption += f"📝 <b>Sinyal:</b> {setup_name}\n"
+            caption += f"🐋 <b>Order Book:</b> {whale_stat}\n"
+            caption += f"📊 <b>Open Interest:</b> {oi_stat}\n"
+            caption += f"📈 <b>Harga:</b> ${data['price']:.4f}\n"
+            caption += f"⚡ <b>Stoch K/D:</b> {data['stoch_k']:.1f} / {data['stoch_d']:.1f}\n"
+            caption += f"📏 <b>MA5/8/13:</b> ${data['ma5']:.4f} | ${data['ma8']:.4f} | ${data['ma13']:.4f}"
+            
+            vip_signals_to_send.append({'sym': sym, 'caption': caption})
 
-    for msg in messages_to_send:
-        send_telegram_message(msg, target_chat_id=chat_id)
-        time.sleep(1) 
+    # ==========================================
+    # PENGIRIMAN HASIL FILTRASI
+    # ==========================================
+    if len(vip_signals_to_send) == 0:
+        send_telegram_message(f"🗑️ <b>Filter Selesai!</b>\nDari {len(setups)} sinyal teknikal awal di {tf_request}, <b>TIDAK ADA</b> yang lolos standar VIP.\n<i>(Sinyal dibuang karena berlawanan dengan Open Interest & Paus / Rawan Fakeout).</i>", chat_id)
+        return
+
+    send_telegram_message(f"🎯 <b>Filter Selesai!</b>\nDari {len(setups)} sinyal awal, ditemukan <b>{len(vip_signals_to_send)} Sinyal HIGH PROBABILITY</b> yang lolos standar VIP (Didukung OI/Paus). Mengirim grafik...", chat_id)
+
+    for item in vip_signals_to_send:
+        sym = item['sym']
+        caption = item['caption']
+        
+        with data_lock: ohlcv = shared_ohlcv[sym][tf_request].copy()
+            
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df = calculate_all_indicators(df)
+        df = df.dropna().reset_index(drop=True)
+        
+        if len(df) > 10:
+            photo_buffer = generate_candlestick_chart(sym, tf_request, df)
+            send_telegram_photo(caption, photo_buffer, chat_id)
+            time.sleep(1.5) 
+        else:
+            send_telegram_message(caption, chat_id)
 
 def telegram_polling_thread():
     offset = None
@@ -317,7 +375,6 @@ def telegram_polling_thread():
             
             req = requests.get(url, params=params, timeout=25)
             if not req.ok:
-                with print_lock: print(f"⚠️ Telegram Connection Error: {req.status_code} - {req.text}")
                 time.sleep(2)
                 continue
 
@@ -338,30 +395,17 @@ def telegram_polling_thread():
                         chat_id = msg_data['chat']['id']
                         text = msg_data['text'].strip().lower()
 
-                        chat_type = msg_data['chat'].get('type', 'unknown')
-                        with print_lock: print(f"\n📩 [LOG] Pesan masuk dari {chat_type} (ID: {chat_id}): '{text}'")
-
                         if 'status' in text or 'menu' in text or 'scan' in text:
-                            with print_lock: print("✅ Perintah valid: Mengirim Status Menu...")
                             reply_msg = get_summary_message()
                             send_telegram_message(reply_msg, target_chat_id=chat_id)
                             continue
 
                         tf_cmd = text.replace('/', '')
                         if tf_cmd in TIMEFRAMES:
-                            with print_lock: print(f"✅ Perintah valid: Mengekstrak Data & Open Interest Koin untuk {tf_cmd}...")
-                            send_detailed_setups(chat_id, tf_cmd)
-                            with print_lock: print(f"✅ Data {tf_cmd} sukses dikirim ke Telegram!")
-                        else:
-                            with print_lock: print(f"❌ Pesan bukan perintah bot (Diabaikan).")
+                            threading.Thread(target=send_detailed_setups, args=(chat_id, tf_cmd)).start()
                         
         except requests.exceptions.ReadTimeout: pass 
         except Exception as e:
-            with print_lock:
-                print("\n============================================")
-                print(f"❌ CRITICAL ERROR DI TELEGRAM POLLING:")
-                traceback.print_exc()
-                print("============================================\n")
             time.sleep(2)
 
 def send_hourly_report():
@@ -508,7 +552,6 @@ def process_data(symbol, tf):
                 with print_lock:
                     print(f"   ✨ [SETUP BARU] {clean_sym} ({tf}) | {pred_dir} | {setup_name}")
             
-            # [BARU] Menyimpan prev_price untuk perbandingan arah trend OI vs Harga
             active_setups[tf][symbol] = {
                 'dir': pred_dir, 
                 'setup_name': setup_name,
@@ -616,7 +659,7 @@ def run_backtest():
 def run_bot():
     is_restored = initialize_memory()
     print("\n======================================================")
-    print("🚀 MENJALANKAN BOT (LOGIC OPEN INTEREST AKTIF)")
+    print("🚀 MENJALANKAN BOT (FILTER SMART & VIP SIGNAL)")
     print("======================================================\n")
 
     if not is_restored:
@@ -672,7 +715,7 @@ def main_menu():
     while True:
         os.system('cls' if os.name == 'nt' else 'clear') 
         print("======================================================")
-        print("🌟 MENU UTAMA BOT (DENGAN OPEN INTEREST) 🌟")
+        print("🌟 MENU UTAMA BOT (DENGAN SMART FILTER VIP) 🌟")
         print("======================================================")
         print("1. 🚀 Jalankan Auto-Scan (Log Terminal Aktif)")
         print("2. 📊 Analisis Backtest (Sampel 10 Koin)")
