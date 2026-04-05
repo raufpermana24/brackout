@@ -52,29 +52,23 @@ print_lock = threading.Lock()
 data_lock = threading.Lock() 
 
 # ==========================================
-# FITUR BARU: MANAJEMEN DATA VPS (BACKUP & HAPUS 2 HARI)
+# MANAJEMEN DATA VPS (BACKUP & CLEANUP)
 # ==========================================
 def manage_vps_storage():
-    """Menyimpan data ke disk VPS dan menghapus file yang berumur > 2 hari"""
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
     current_time = time.time()
-    
-    # 1. CLEANUP: Hapus data yang lebih tua dari 2 hari (48 Jam)
     for filename in os.listdir(DATA_DIR):
         filepath = os.path.join(DATA_DIR, filename)
         if os.path.isfile(filepath):
             file_age_seconds = current_time - os.path.getmtime(filepath)
-            if file_age_seconds > (2 * 24 * 3600): # Jika usia file > 2 hari
+            if file_age_seconds > (2 * 24 * 3600): 
                 try:
                     os.remove(filepath)
-                    with print_lock:
-                        print(f"🧹 VPS Auto-Clean: Menghapus data usang {filename}")
-                except Exception as e:
-                    pass
+                    with print_lock: print(f"🧹 VPS Auto-Clean: Menghapus data usang {filename}")
+                except Exception: pass
 
-    # 2. BACKUP: Menggandakan RAM untuk disimpan ke VPS
     date_str = datetime.now().strftime("%Y-%m-%d_%H-%M")
     save_path = os.path.join(DATA_DIR, f"bot_state_{date_str}.json")
 
@@ -88,18 +82,13 @@ def manage_vps_storage():
         }
 
     try:
-        with open(save_path, "w") as f:
-            json.dump(state_to_save, f)
-        with print_lock:
-            print(f"💾 Data berhasil dicadangkan ke VPS: {save_path}")
+        with open(save_path, "w") as f: json.dump(state_to_save, f)
+        with print_lock: print(f"💾 Data berhasil dicadangkan ke VPS: {save_path}")
     except Exception as e:
-        with print_lock:
-            print(f"⚠️ Gagal menyimpan data ke VPS: {e}")
+        with print_lock: print(f"⚠️ Gagal menyimpan data ke VPS: {e}")
 
 def load_vps_data():
-    """Mengembalikan ingatan bot dari data VPS terakhir saat bot direstart"""
     global performance_stats, locked_predictions, last_signaled_candle, shared_ohlcv, active_setups
-    
     if not os.path.exists(DATA_DIR): return
     files = [os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR) if f.endswith('.json')]
     if not files: return
@@ -108,8 +97,7 @@ def load_vps_data():
     print(f"🔄 Memulihkan data memori dari VPS: {latest_file}...")
     
     try:
-        with open(latest_file, "r") as f:
-            state = json.load(f)
+        with open(latest_file, "r") as f: state = json.load(f)
 
         with data_lock:
             if "performance_stats" in state: performance_stats.update(state["performance_stats"])
@@ -154,7 +142,6 @@ def initialize_memory():
         ccxt_to_ws_sym[sym] = ws_sym
         ws_to_ccxt_sym[ws_sym] = sym
         
-    # Tarik data dari HDD VPS jika ada
     load_vps_data()
 
 # ==========================================
@@ -170,10 +157,7 @@ def ws_on_message(ws, message):
             
             if sym_ws in ws_to_ccxt_sym and tf in TIMEFRAMES:
                 sym_ccxt = ws_to_ccxt_sym[sym_ws]
-                candle = [
-                    kline['t'], float(kline['o']), float(kline['h']), 
-                    float(kline['l']), float(kline['c']), float(kline['v'])
-                ]
+                candle = [kline['t'], float(kline['o']), float(kline['h']), float(kline['l']), float(kline['c']), float(kline['v'])]
                 with data_lock:
                     history = shared_ohlcv[sym_ccxt][tf]
                     if not history: history.append(candle)
@@ -183,8 +167,7 @@ def ws_on_message(ws, message):
                         elif candle[0] > last_t:
                             history.append(candle)
                             if len(history) > LIMIT: history.pop(0)
-    except Exception:
-        pass
+    except Exception: pass
 
 def ws_on_open(ws):
     print("📡 Terhubung ke Binance WebSocket! Berlangganan Stream Data...")
@@ -201,14 +184,15 @@ def start_websocket_thread():
     threading.Thread(target=lambda: ws.run_forever(), daemon=True).start()
 
 # ==========================================
-# FUNGSI TELEGRAM (ON-DEMAND POLLING)
+# FUNGSI TELEGRAM (ON-DEMAND POLLING DENGAN DEBUG)
 # ==========================================
 def send_telegram_message(message, target_chat_id=None):
     chat = target_chat_id if target_chat_id else TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": chat, "text": message, "parse_mode": "HTML"}
     try: requests.post(url, json=payload, timeout=10)
-    except Exception: pass
+    except Exception as e: 
+        with print_lock: print(f"⚠️ Gagal kirim ke Telegram: {e}")
 
 def format_setup_table(tf_request):
     setups = active_setups.get(tf_request, {})
@@ -258,15 +242,27 @@ def telegram_polling_thread():
             if 'result' in response:
                 for update in response['result']:
                     offset = update['update_id'] + 1
+                    
                     if 'message' in update and 'text' in update['message']:
                         chat_id = update['message']['chat']['id']
                         text = update['message']['text'].strip().lower()
 
+                        # --- LOG DEBUGGING KE TERMINAL ---
+                        with print_lock:
+                            print(f"\n📩 Pesan Telegram Diterima: '{text}' (Chat ID: {chat_id})")
+
+                        # Mengecek perintah (Bisa membedakan /5m atau 5m)
                         tf_cmd = text.replace('/', '')
                         if tf_cmd in TIMEFRAMES:
+                            with print_lock: print(f"✅ Mengeksekusi permintaan data tabel {tf_cmd}...")
                             reply_msg = format_setup_table(tf_cmd)
                             send_telegram_message(reply_msg, target_chat_id=chat_id)
-        except Exception:
+                        else:
+                            with print_lock: print(f"ℹ️ Pesan diabaikan (Bukan perintah timeframe valid).")
+        except requests.exceptions.ReadTimeout:
+            pass # Timeout wajar pada Long Polling Telegram
+        except Exception as e:
+            with print_lock: print(f"⚠️ Telegram Polling Error: {e}")
             time.sleep(2)
 
 def send_hourly_report():
@@ -292,8 +288,7 @@ def send_hourly_report():
     send_telegram_message(table_str)
     
     clean_terminal = table_str.replace("<b>", "").replace("</b>", "").replace("<pre>\n", "").replace("</pre>\n", "")
-    with print_lock:
-        print(f"\n======================================================\n{clean_terminal}\n======================================================\n")
+    with print_lock: print(f"\n======================================================\n{clean_terminal}\n======================================================\n")
 
 # ==========================================
 # INDIKATOR, WHALE TRACKER & LOGIKA
@@ -312,8 +307,7 @@ def get_order_book_whale_status(symbol):
         if buy_pct > 60: return "🟢" 
         if buy_pct < 40: return "🔴" 
         return "⚪"
-    except:
-        return "⚪"
+    except: return "⚪"
 
 def calculate_all_indicators(df):
     df['MID_BB'] = df['close'].rolling(window=20).mean()
@@ -407,10 +401,8 @@ def process_data(symbol, tf):
         if len(ohlcv) < 30:
             try:
                 ohlcv = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=LIMIT)
-                with data_lock:
-                    shared_ohlcv[symbol][tf] = ohlcv 
-            except Exception:
-                return 
+                with data_lock: shared_ohlcv[symbol][tf] = ohlcv 
+            except Exception: return 
                 
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df = calculate_all_indicators(df)
@@ -428,30 +420,16 @@ def process_data(symbol, tf):
             
         if pred_dir != "NETRAL":
             whale_status = get_order_book_whale_status(symbol)
-            
-            # Kunci setup untuk ditayangkan di telegram via on-demand
-            active_setups[tf][symbol] = {
-                'dir': pred_dir,
-                'setup_name': setup_name,
-                'whale': whale_status
-            }
-            
-            locked_predictions[symbol][tf] = {
-                'timestamp': current_candle['timestamp'],
-                'pred_dir': pred_dir,
-                'setup_name': setup_name
-            }
+            active_setups[tf][symbol] = {'dir': pred_dir, 'setup_name': setup_name, 'whale': whale_status}
+            locked_predictions[symbol][tf] = {'timestamp': current_candle['timestamp'], 'pred_dir': pred_dir, 'setup_name': setup_name}
         else:
-            if symbol in active_setups[tf]:
-                del active_setups[tf][symbol]
-                
+            if symbol in active_setups[tf]: del active_setups[tf][symbol]
             locked_predictions[symbol][tf] = None
 
-    except Exception:
-        pass
+    except Exception: pass
 
 # ==========================================
-# BACKTEST (SAMPEL)
+# BACKTEST 
 # ==========================================
 def run_backtest():
     initialize_memory()
@@ -478,8 +456,7 @@ def run_backtest():
                     all_ohlcv.extend(ohlcv)
                     since = ohlcv[-1][0] + 1
                     time.sleep(0.05)
-                except Exception:
-                    break
+                except Exception: break
                     
             if not all_ohlcv: continue
             
@@ -532,32 +509,27 @@ def run_bot():
     start_websocket_thread()
     threading.Thread(target=telegram_polling_thread, daemon=True).start()
 
-    send_telegram_message(f"🤖 <b>Bot Ultimate (VPS Mode) Siap!</b>\nMengumpulkan data {len(SYMBOLS)} koin secara diam-diam. Data VPS otomatis dihapus per 2 Hari.\n\nKetik <b>5m</b>, <b>1h</b>, atau <b>4h</b> untuk melihat Daftar Koin yang berpotensi.")
+    send_telegram_message(f"🤖 <b>Bot Ultimate (VPS Mode) Siap!</b>\nMengumpulkan data {len(SYMBOLS)} koin secara diam-diam. Data VPS otomatis dihapus per 2 Hari.\n\nKetik <b>/5m</b>, <b>/1h</b>, atau <b>/4h</b> untuk melihat Daftar Koin yang berpotensi.")
     
     global last_report_time
     last_report_time = datetime.now() 
 
     try:
         while True:
-            # Scan market
             with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
                 futures = [executor.submit(process_data, sym, tf) for sym in SYMBOLS for tf in TIMEFRAMES]
                 concurrent.futures.wait(futures)
             
-            # Jika sudah 1 jam, laporkan akurasi, lalu Backup ke HDD VPS (serta hapus file > 2 hari)
             if (datetime.now() - last_report_time).total_seconds() >= 3600:
                 send_hourly_report()
-                manage_vps_storage() # Panggil Fungsi Rotator Disk VPS
+                manage_vps_storage()
                         
             time.sleep(5) 
             
     except KeyboardInterrupt:
         print("\n\n🛑 Bot dihentikan.")
-        
-        # Simpan state terakhir sebelum dimatikan paksa
         print("💾 Melakukan backup darurat sebelum keluar...")
         manage_vps_storage()
-        
         send_telegram_message("🛑 <b>Bot dihentikan. Data telah dibackup dengan aman ke VPS.</b>")
         time.sleep(1) 
 
