@@ -213,6 +213,40 @@ def get_summary_message():
         msg += "\n\n⚠️ <i>Pasar sedang konsolidasi, belum ada setup valid ditemukan.</i>"
     return msg
 
+# ==========================================
+# [BARU] ANALISIS OPEN INTEREST (OI)
+# ==========================================
+def get_open_interest_analysis(symbol, tf, current_price, prev_price):
+    """Mengambil dan membandingkan data Open Interest secara real-time"""
+    try:
+        # Merapikan symbol (Contoh: BTC/USDT:USDT -> BTCUSDT)
+        clean_sym = symbol.split(':')[0].replace('/', '')
+        
+        # Menggunakan jalur langsung (Direct Request) agar bebas dari batasan library CCXT
+        url = f"https://fapi.binance.com/futures/data/openInterestHist?symbol={clean_sym}&period={tf}&limit=2"
+        res = requests.get(url, timeout=5).json()
+        
+        if len(res) >= 2:
+            oi_prev = float(res[0]['sumOpenInterestValue'])
+            oi_curr = float(res[1]['sumOpenInterestValue'])
+            
+            oi_up = oi_curr > oi_prev
+            price_up = current_price > prev_price
+            
+            # Logika Open Interest + Harga Sesuai Standar Institusi
+            if oi_up and price_up:
+                return "🟢 Bullish Menguat (Modal Baru Masuk | OI ⬆️ & Harga ⬆️)"
+            elif oi_up and not price_up:
+                return "🔴 Bearish Menguat (Short Baru Masuk | OI ⬆️ & Harga ⬇️)"
+            elif not oi_up and price_up:
+                return "⚠️ Bullish Melemah (Posisi Long Ditutup | OI ⬇️ & Harga ⬆️)"
+            elif not oi_up and not price_up:
+                return "⚠️ Bearish Melemah (Short Covering | OI ⬇️ & Harga ⬇️)"
+                
+    except Exception as e:
+        pass
+    return "⚪ Data OI Tidak Tersedia"
+
 def send_detailed_setups(chat_id, tf_request):
     setups = active_setups.get(tf_request, {})
     
@@ -232,6 +266,7 @@ def send_detailed_setups(chat_id, tf_request):
         clean_sym = sym.split('/')[0] 
         dir_icon = "🟢 LONG" if data['dir'] == "UP" else "🔴 SHORT"
         
+        # 1. Pengecekan Order Book (Paus)
         try:
             ob = exchange.fetch_order_book(sym, limit=20)
             bids, asks = ob['bids'], ob['asks']
@@ -239,16 +274,20 @@ def send_detailed_setups(chat_id, tf_request):
             total_ask = sum(a[1] for a in asks)
             tot = total_bid + total_ask
             buy_pct = (total_bid / tot) * 100 if tot > 0 else 50
-            if buy_pct > 60: whale_stat = f"🟢 Didominasi Beli ({buy_pct:.0f}%)"
-            elif buy_pct < 40: whale_stat = f"🔴 Didominasi Jual ({(100-buy_pct):.0f}%)"
+            if buy_pct > 60: whale_stat = f"🟢 Dominan Beli ({buy_pct:.0f}%)"
+            elif buy_pct < 40: whale_stat = f"🔴 Dominan Jual ({(100-buy_pct):.0f}%)"
             else: whale_stat = f"⚪ Netral / Ragu-ragu ({buy_pct:.0f}% Beli)"
         except:
             whale_stat = "⚪ Data Paus Tidak Tersedia"
 
+        # 2. Pengecekan Open Interest (Analisis Arus Modal)
+        oi_stat = get_open_interest_analysis(sym, tf_request, data['price'], data['prev_price'])
+
         coin_block = f"<b>🪙 {clean_sym}/USDT | {dir_icon}</b>\n"
         coin_block += f"📝 <b>Sinyal:</b> {data['setup_name']}\n"
-        coin_block += f"🐋 <b>Paus:</b> {whale_stat}\n"
-        coin_block += f"📈 <b>Harga:</b> ${data['price']:.4f}\n"
+        coin_block += f"🐋 <b>Order Book:</b> {whale_stat}\n"
+        coin_block += f"📊 <b>Open Interest:</b> {oi_stat}\n"
+        coin_block += f"📈 <b>Harga Saat Ini:</b> ${data['price']:.4f}\n"
         coin_block += f"⚡ <b>Stoch K/D:</b> {data['stoch_k']:.1f} / {data['stoch_d']:.1f}\n"
         coin_block += f"📏 <b>MA5/8/13:</b> ${data['ma5']:.4f} | ${data['ma8']:.4f} | ${data['ma13']:.4f}\n"
         coin_block += "➖➖➖➖➖➖➖➖➖➖\n"
@@ -310,7 +349,7 @@ def telegram_polling_thread():
 
                         tf_cmd = text.replace('/', '')
                         if tf_cmd in TIMEFRAMES:
-                            with print_lock: print(f"✅ Perintah valid: Mengekstrak Data Koin untuk {tf_cmd}...")
+                            with print_lock: print(f"✅ Perintah valid: Mengekstrak Data & Open Interest Koin untuk {tf_cmd}...")
                             send_detailed_setups(chat_id, tf_cmd)
                             with print_lock: print(f"✅ Data {tf_cmd} sukses dikirim ke Telegram!")
                         else:
@@ -411,13 +450,12 @@ def detect_trading_setup(df):
     ma5_cross_up = (prev['close'] <= prev['MA5_CLOSE']) and (curr['close'] > curr['MA5_CLOSE'])
     ma5_cross_down = (prev['close'] >= prev['MA5_CLOSE']) and (curr['close'] < curr['MA5_CLOSE'])
 
-    # [PERBAIKAN ERROR PARSING HTML TELEGRAM]: Mengganti tanda '<' dan '>' menjadi '&lt;' dan '&gt;' pada text
-    if bbma_sell and stoch_sell: return "PERFECT SELL (Extreme BBMA + Stoch Cross &gt;80) 🌟🔴", "DOWN"
-    elif bbma_buy and stoch_buy: return "PERFECT BUY (Extreme BBMA + Stoch Cross &lt;20) 🌟🟢", "UP"
+    if bbma_sell and stoch_sell: return "PERFECT SELL (Extreme BBMA + Stoch Cross >80) 🌟🔴", "DOWN"
+    elif bbma_buy and stoch_buy: return "PERFECT BUY (Extreme BBMA + Stoch Cross <20) 🌟🟢", "UP"
     elif bbma_sell: return "EXTREME SELL (MA5 Keluar Top BB) ⚠️🔴", "DOWN"
     elif bbma_buy: return "EXTREME BUY (MA5 Keluar Low BB) ⚠️🟢", "UP"
-    elif stoch_sell: return "STOCH SELL (Garis %K Memotong %D ke Bawah di &gt;80) 📉🔴", "DOWN"
-    elif stoch_buy: return "STOCH BUY (Garis %K Memotong %D ke Atas di &lt;20) 📈🟢", "UP"
+    elif stoch_sell: return "STOCH SELL (Garis %K Memotong %D ke Bawah di >80) 📉🔴", "DOWN"
+    elif stoch_buy: return "STOCH BUY (Garis %K Memotong %D ke Atas di <20) 📈🟢", "UP"
     elif ma813_cross_up: return "MA8/MA13 GOLDEN CROSS (Candle Close Konfirmasi Naik) ⚔️📈", "UP"
     elif ma813_cross_down: return "MA8/MA13 DEATH CROSS (Candle Close Konfirmasi Turun) ⚔️📉", "DOWN"
     elif ma5_cross_up: return "MA5 CROSSOVER BUY (Candle Menembus & Close di atas MA5) 📈🟢", "UP"
@@ -460,9 +498,6 @@ def process_data(symbol, tf):
         if past_pred is not None and past_pred['timestamp'] == closed_candle['timestamp']:
             evaluate_past_prediction(symbol, tf, closed_candle, past_pred)
             
-        # ==========================================
-        # LOGIKA LOGGING SETUP BARU/HILANG
-        # ==========================================
         if pred_dir != "NETRAL":
             is_new = False
             if past_pred is None: is_new = True
@@ -473,10 +508,12 @@ def process_data(symbol, tf):
                 with print_lock:
                     print(f"   ✨ [SETUP BARU] {clean_sym} ({tf}) | {pred_dir} | {setup_name}")
             
+            # [BARU] Menyimpan prev_price untuk perbandingan arah trend OI vs Harga
             active_setups[tf][symbol] = {
                 'dir': pred_dir, 
                 'setup_name': setup_name,
                 'price': current_candle['close'],
+                'prev_price': closed_candle['close'],
                 'stoch_k': current_candle['STOCH_K'],
                 'stoch_d': current_candle['STOCH_D'],
                 'ma5': current_candle['MA5_CLOSE'],
@@ -579,7 +616,7 @@ def run_backtest():
 def run_bot():
     is_restored = initialize_memory()
     print("\n======================================================")
-    print("🚀 MENJALANKAN BOT (LIVE SCAN & LOG TERMINAL)")
+    print("🚀 MENJALANKAN BOT (LOGIC OPEN INTEREST AKTIF)")
     print("======================================================\n")
 
     if not is_restored:
@@ -617,7 +654,7 @@ def run_bot():
             cycle_duration = time.time() - cycle_start
             total_active = sum(len(active_setups[tf]) for tf in TIMEFRAMES)
             with print_lock:
-                print(f"✅ [AUTO-SCAN] Selesai dalam {cycle_duration:.2f} detik. Total {total_active} setup aktif ditahan di memori.")
+                print(f"✅ [AUTO-SCAN] Selesai dalam {cycle_duration:.2f} detik. Total {total_active} setup ditahan di memori.")
             
             if (datetime.now() - last_report_time).total_seconds() >= 3600:
                 send_hourly_report()
@@ -635,7 +672,7 @@ def main_menu():
     while True:
         os.system('cls' if os.name == 'nt' else 'clear') 
         print("======================================================")
-        print("🌟 MENU UTAMA BOT (LIVE SCAN LOG & DETAILS) 🌟")
+        print("🌟 MENU UTAMA BOT (DENGAN OPEN INTEREST) 🌟")
         print("======================================================")
         print("1. 🚀 Jalankan Auto-Scan (Log Terminal Aktif)")
         print("2. 📊 Analisis Backtest (Sampel 10 Koin)")
