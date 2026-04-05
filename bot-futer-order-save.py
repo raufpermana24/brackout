@@ -411,12 +411,13 @@ def detect_trading_setup(df):
     ma5_cross_up = (prev['close'] <= prev['MA5_CLOSE']) and (curr['close'] > curr['MA5_CLOSE'])
     ma5_cross_down = (prev['close'] >= prev['MA5_CLOSE']) and (curr['close'] < curr['MA5_CLOSE'])
 
-    if bbma_sell and stoch_sell: return "PERFECT SELL (Extreme BBMA + Stoch Cross >80) 🌟🔴", "DOWN"
-    elif bbma_buy and stoch_buy: return "PERFECT BUY (Extreme BBMA + Stoch Cross <20) 🌟🟢", "UP"
+    # [PERBAIKAN ERROR PARSING HTML TELEGRAM]: Mengganti tanda '<' dan '>' menjadi '&lt;' dan '&gt;' pada text
+    if bbma_sell and stoch_sell: return "PERFECT SELL (Extreme BBMA + Stoch Cross &gt;80) 🌟🔴", "DOWN"
+    elif bbma_buy and stoch_buy: return "PERFECT BUY (Extreme BBMA + Stoch Cross &lt;20) 🌟🟢", "UP"
     elif bbma_sell: return "EXTREME SELL (MA5 Keluar Top BB) ⚠️🔴", "DOWN"
     elif bbma_buy: return "EXTREME BUY (MA5 Keluar Low BB) ⚠️🟢", "UP"
-    elif stoch_sell: return "STOCH SELL (Garis %K Memotong %D ke Bawah di >80) 📉🔴", "DOWN"
-    elif stoch_buy: return "STOCH BUY (Garis %K Memotong %D ke Atas di <20) 📈🟢", "UP"
+    elif stoch_sell: return "STOCH SELL (Garis %K Memotong %D ke Bawah di &gt;80) 📉🔴", "DOWN"
+    elif stoch_buy: return "STOCH BUY (Garis %K Memotong %D ke Atas di &lt;20) 📈🟢", "UP"
     elif ma813_cross_up: return "MA8/MA13 GOLDEN CROSS (Candle Close Konfirmasi Naik) ⚔️📈", "UP"
     elif ma813_cross_down: return "MA8/MA13 DEATH CROSS (Candle Close Konfirmasi Turun) ⚔️📉", "DOWN"
     elif ma5_cross_up: return "MA5 CROSSOVER BUY (Candle Menembus & Close di atas MA5) 📈🟢", "UP"
@@ -460,7 +461,7 @@ def process_data(symbol, tf):
             evaluate_past_prediction(symbol, tf, closed_candle, past_pred)
             
         # ==========================================
-        # [BARU] LOGIKA LOGGING SETUP BARU/HILANG
+        # LOGIKA LOGGING SETUP BARU/HILANG
         # ==========================================
         if pred_dir != "NETRAL":
             is_new = False
@@ -594,7 +595,6 @@ def run_bot():
 
     try:
         while True:
-            # [BARU] Log Siklus Pemindaian Rutin
             cycle_start = time.time()
             total_tasks = len(SYMBOLS) * len(TIMEFRAMES)
             completed_tasks = 0
@@ -607,7 +607,6 @@ def run_bot():
                 process_data(sym, tf)
                 with print_lock:
                     completed_tasks += 1
-                    # Menampilkan progress berkala tanpa membuat terminal penuh
                     if completed_tasks > 0 and completed_tasks % 100 == 0:
                         print(f"   ► Progress: {completed_tasks}/{total_tasks} chart dipindai...")
 
