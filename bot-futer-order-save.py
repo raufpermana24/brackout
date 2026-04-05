@@ -9,7 +9,8 @@ import concurrent.futures
 import threading
 import json
 import websocket # Membutuhkan: pip install websocket-client
-import copy      
+import copy
+import traceback 
 
 # ==========================================
 # KREDENSIAL API & TELEGRAM
@@ -182,15 +183,18 @@ def start_websocket_thread():
     threading.Thread(target=lambda: ws.run_forever(), daemon=True).start()
 
 # ==========================================
-# FUNGSI TELEGRAM (ON-DEMAND & DETAIL PER KOIN)
+# FUNGSI TELEGRAM
 # ==========================================
 def send_telegram_message(message, target_chat_id=None):
     chat = target_chat_id if target_chat_id else TELEGRAM_CHAT_ID
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": chat, "text": message, "parse_mode": "HTML"}
-    try: requests.post(url, json=payload, timeout=10)
+    try: 
+        req = requests.post(url, json=payload, timeout=10)
+        if not req.ok:
+            with print_lock: print(f"⚠️ Telegram API Error (Send): {req.text}")
     except Exception as e: 
-        with print_lock: print(f"⚠️ Gagal kirim ke Telegram: {e}")
+        with print_lock: print(f"⚠️ Gagal kirim koneksi ke Telegram: {e}")
 
 def get_summary_message():
     msg = "<b>📢 HASIL PEMINDAIAN PASAR SAAT INI</b>\n\n"
@@ -210,7 +214,6 @@ def get_summary_message():
     return msg
 
 def send_detailed_setups(chat_id, tf_request):
-    """Menghasilkan laporan terperinci PER KOIN bukan dalam bentuk tabel"""
     setups = active_setups.get(tf_request, {})
     
     if not setups:
@@ -229,7 +232,6 @@ def send_detailed_setups(chat_id, tf_request):
         clean_sym = sym.split('/')[0] 
         dir_icon = "🟢 LONG" if data['dir'] == "UP" else "🔴 SHORT"
         
-        # Mengecek Data Paus Secara Live hanya untuk koin yang di-request
         try:
             ob = exchange.fetch_order_book(sym, limit=20)
             bids, asks = ob['bids'], ob['asks']
@@ -243,17 +245,14 @@ def send_detailed_setups(chat_id, tf_request):
         except:
             whale_stat = "⚪ Data Paus Tidak Tersedia"
 
-        # Menyusun Format Rincian Per Koin
         coin_block = f"<b>🪙 {clean_sym}/USDT | {dir_icon}</b>\n"
         coin_block += f"📝 <b>Sinyal:</b> {data['setup_name']}\n"
         coin_block += f"🐋 <b>Paus:</b> {whale_stat}\n"
         coin_block += f"📈 <b>Harga:</b> ${data['price']:.4f}\n"
-        coin_block += f"⚡ <b>Stoch K / D:</b> {data['stoch_k']:.1f} / {data['stoch_d']:.1f}\n"
-        coin_block += f"📏 <b>MA5 / 8 / 13:</b> ${data['ma5']:.4f} | ${data['ma8']:.4f} | ${data['ma13']:.4f}\n"
+        coin_block += f"⚡ <b>Stoch K/D:</b> {data['stoch_k']:.1f} / {data['stoch_d']:.1f}\n"
+        coin_block += f"📏 <b>MA5/8/13:</b> ${data['ma5']:.4f} | ${data['ma8']:.4f} | ${data['ma13']:.4f}\n"
         coin_block += "➖➖➖➖➖➖➖➖➖➖\n"
 
-        # Telegram membatasi 4000 karakter per pesan. 
-        # Jika teks terlalu panjang, kita potong dan masukkan ke antrean pesan berikutnya.
         if len(current_msg) + len(coin_block) > 3800:
             messages_to_send.append(current_msg)
             current_msg = coin_block
@@ -263,10 +262,9 @@ def send_detailed_setups(chat_id, tf_request):
     if current_msg:
         messages_to_send.append(current_msg)
 
-    # Kirim semua pesan hasil pemotongan secara berurutan
     for msg in messages_to_send:
         send_telegram_message(msg, target_chat_id=chat_id)
-        time.sleep(1) # Jeda agar bot tidak kena blokir spam Telegram
+        time.sleep(1) 
 
 def telegram_polling_thread():
     offset = None
@@ -277,7 +275,14 @@ def telegram_polling_thread():
         try:
             params = {'timeout': 20}
             if offset: params['offset'] = offset
-            response = requests.get(url, params=params, timeout=5).json()
+            
+            req = requests.get(url, params=params, timeout=25)
+            if not req.ok:
+                with print_lock: print(f"⚠️ Telegram Connection Error: {req.status_code} - {req.text}")
+                time.sleep(2)
+                continue
+
+            response = req.json()
 
             if 'result' in response:
                 for update in response['result']:
@@ -286,29 +291,39 @@ def telegram_polling_thread():
                     msg_data = None
                     if 'message' in update: msg_data = update['message']
                     elif 'channel_post' in update: msg_data = update['channel_post']
+                    elif 'edited_message' in update: msg_data = update['edited_message']
+                    elif 'edited_channel_post' in update: msg_data = update['edited_channel_post']
+                    else: continue
                     
                     if msg_data and 'text' in msg_data:
                         chat_id = msg_data['chat']['id']
                         text = msg_data['text'].strip().lower()
 
                         chat_type = msg_data['chat'].get('type', 'unknown')
-                        with print_lock: print(f"\n📩 Pesan Diterima: '{text}'")
+                        with print_lock: print(f"\n📩 [LOG] Pesan masuk dari {chat_type} (ID: {chat_id}): '{text}'")
 
                         if 'status' in text or 'menu' in text or 'scan' in text:
+                            with print_lock: print("✅ Perintah valid: Mengirim Status Menu...")
                             reply_msg = get_summary_message()
                             send_telegram_message(reply_msg, target_chat_id=chat_id)
                             continue
 
                         tf_cmd = text.replace('/', '')
                         if tf_cmd in TIMEFRAMES:
-                            with print_lock: print(f"✅ Mengirim analisa detail {tf_cmd} per koin...")
+                            with print_lock: print(f"✅ Perintah valid: Mengekstrak Data Koin untuk {tf_cmd}...")
                             send_detailed_setups(chat_id, tf_cmd)
-                            with print_lock: print(f"✅ Seluruh data {tf_cmd} sukses dikirim!")
+                            with print_lock: print(f"✅ Data {tf_cmd} sukses dikirim ke Telegram!")
+                        else:
+                            with print_lock: print(f"❌ Pesan bukan perintah bot (Diabaikan).")
                         
-        except requests.exceptions.ReadTimeout:
-            pass 
+        except requests.exceptions.ReadTimeout: pass 
         except Exception as e:
-            time.sleep(1)
+            with print_lock:
+                print("\n============================================")
+                print(f"❌ CRITICAL ERROR DI TELEGRAM POLLING:")
+                traceback.print_exc()
+                print("============================================\n")
+            time.sleep(2)
 
 def send_hourly_report():
     global last_report_time
@@ -444,8 +459,19 @@ def process_data(symbol, tf):
         if past_pred is not None and past_pred['timestamp'] == closed_candle['timestamp']:
             evaluate_past_prediction(symbol, tf, closed_candle, past_pred)
             
+        # ==========================================
+        # [BARU] LOGIKA LOGGING SETUP BARU/HILANG
+        # ==========================================
         if pred_dir != "NETRAL":
-            # [BARU] Menyimpan data teknikal detail agar bisa ditampilkan saat di-request
+            is_new = False
+            if past_pred is None: is_new = True
+            elif past_pred['setup_name'] != setup_name: is_new = True
+                
+            if is_new:
+                clean_sym = symbol.replace(':USDT', '')
+                with print_lock:
+                    print(f"   ✨ [SETUP BARU] {clean_sym} ({tf}) | {pred_dir} | {setup_name}")
+            
             active_setups[tf][symbol] = {
                 'dir': pred_dir, 
                 'setup_name': setup_name,
@@ -460,7 +486,12 @@ def process_data(symbol, tf):
             }
             locked_predictions[symbol][tf] = {'timestamp': current_candle['timestamp'], 'pred_dir': pred_dir, 'setup_name': setup_name}
         else:
-            if symbol in active_setups[tf]: del active_setups[tf][symbol]
+            if symbol in active_setups[tf]:
+                clean_sym = symbol.replace(':USDT', '')
+                with print_lock:
+                    print(f"   🗑️ [SETUP HILANG] {clean_sym} ({tf}) | Momentum tidak valid lagi.")
+                del active_setups[tf][symbol]
+                
             locked_predictions[symbol][tf] = None
 
     except Exception: pass
@@ -473,8 +504,8 @@ def initial_mass_scan():
         futures = [executor.submit(process_data, sym, tf) for sym in SYMBOLS for tf in TIMEFRAMES]
         total = len(futures)
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            if i % 50 == 0:
-                print(f"   [Progress: {i}/{total} Tugas Selesai...]")
+            if i > 0 and i % 50 == 0:
+                print(f"   [Progress Awal: {i}/{total} Tugas Selesai...]")
                 
     print("✅ Mass Scan Selesai! Mengirim Laporan Ringkasan ke Telegram...")
     summary_msg = get_summary_message()
@@ -547,7 +578,7 @@ def run_backtest():
 def run_bot():
     is_restored = initialize_memory()
     print("\n======================================================")
-    print("🚀 MENJALANKAN BOT (OUTPUT DATA PER KOIN)")
+    print("🚀 MENJALANKAN BOT (LIVE SCAN & LOG TERMINAL)")
     print("======================================================\n")
 
     if not is_restored:
@@ -563,9 +594,31 @@ def run_bot():
 
     try:
         while True:
+            # [BARU] Log Siklus Pemindaian Rutin
+            cycle_start = time.time()
+            total_tasks = len(SYMBOLS) * len(TIMEFRAMES)
+            completed_tasks = 0
+            
+            with print_lock:
+                print(f"\n🔄 [AUTO-SCAN] Memulai siklus pemindaian {len(SYMBOLS)} koin ({total_tasks} chart)...")
+
+            def scan_and_count(sym, tf):
+                nonlocal completed_tasks
+                process_data(sym, tf)
+                with print_lock:
+                    completed_tasks += 1
+                    # Menampilkan progress berkala tanpa membuat terminal penuh
+                    if completed_tasks > 0 and completed_tasks % 100 == 0:
+                        print(f"   ► Progress: {completed_tasks}/{total_tasks} chart dipindai...")
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
-                futures = [executor.submit(process_data, sym, tf) for sym in SYMBOLS for tf in TIMEFRAMES]
+                futures = [executor.submit(scan_and_count, sym, tf) for sym in SYMBOLS for tf in TIMEFRAMES]
                 concurrent.futures.wait(futures)
+            
+            cycle_duration = time.time() - cycle_start
+            total_active = sum(len(active_setups[tf]) for tf in TIMEFRAMES)
+            with print_lock:
+                print(f"✅ [AUTO-SCAN] Selesai dalam {cycle_duration:.2f} detik. Total {total_active} setup aktif ditahan di memori.")
             
             if (datetime.now() - last_report_time).total_seconds() >= 3600:
                 send_hourly_report()
@@ -583,9 +636,9 @@ def main_menu():
     while True:
         os.system('cls' if os.name == 'nt' else 'clear') 
         print("======================================================")
-        print("🌟 MENU UTAMA BOT (ANALISIS PER KOIN) 🌟")
+        print("🌟 MENU UTAMA BOT (LIVE SCAN LOG & DETAILS) 🌟")
         print("======================================================")
-        print("1. 🚀 Jalankan Auto-Scan & Pengumpul Background")
+        print("1. 🚀 Jalankan Auto-Scan (Log Terminal Aktif)")
         print("2. 📊 Analisis Backtest (Sampel 10 Koin)")
         print("3. ❌ Keluar / Matikan Program")
         print("======================================================")
