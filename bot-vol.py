@@ -13,7 +13,7 @@ import copy
 import traceback
 
 import matplotlib
-matplotlib.use('Agg') # Render chart di background tanpa GUI
+matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 import io
 
@@ -56,11 +56,8 @@ class BinanceProScanner:
         self.rest_url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
         self.market_data = {}
         self.ws_connected = False
-        
-        # Lock untuk mengamankan data dari tabrakan antar Thread (Thread Safety)
         self.data_lock = threading.Lock()
         
-        # Inisialisasi CCXT untuk persiapan fitur trading/fetching advance kedepannya
         self.exchange = ccxt.binanceusdm({
             'apiKey': BINANCE_API_KEY,
             'secret': BINANCE_SECRET_KEY,
@@ -73,7 +70,7 @@ class BinanceProScanner:
     def on_message(self, ws, message):
         try:
             data = json.loads(message)
-            with self.data_lock: # Kunci memori saat update data
+            with self.data_lock: 
                 for koin in data:
                     simbol = koin['s']
                     if simbol.endswith('USDT') and '_' not in simbol:
@@ -82,6 +79,7 @@ class BinanceProScanner:
                             'harga_sekarang': float(koin['c']),
                             'volume_koin': float(koin['v']),
                             'volume_usdt_asli': float(koin['q']),
+                            'perubahan_persen': float(koin['P']) # <--- TAMBAHAN: Ambil % perubahan 24j
                         }
         except Exception:
             pass
@@ -91,7 +89,7 @@ class BinanceProScanner:
 
     def on_close(self, ws, close_status_code, close_msg):
         self.ws_connected = False
-        print("[!] WS Terputus. Mencoba reconect otomatis di background...")
+        print("[!] WS Terputus. Bot akan menggunakan REST API sementara.")
 
     def on_open(self, ws):
         self.ws_connected = True
@@ -108,10 +106,9 @@ class BinanceProScanner:
         wst.start()
 
     # ==========================================
-    # REST API FALLBACK (CCXT / REQUESTS)
+    # REST API FALLBACK
     # ==========================================
     def ambil_data_rest_api(self):
-        """Fallback menggunakan REST API standar jika WS putus"""
         headers = {'X-MBX-APIKEY': BINANCE_API_KEY}
         try:
             respons = requests.get(self.rest_url, headers=headers)
@@ -126,11 +123,11 @@ class BinanceProScanner:
                             'simbol': simbol,
                             'harga_sekarang': float(koin['lastPrice']),
                             'volume_koin': float(koin['volume']),
-                            'volume_usdt_asli': float(koin['quoteVolume'])
+                            'volume_usdt_asli': float(koin['quoteVolume']),
+                            'perubahan_persen': float(koin['priceChangePercent']) # <--- TAMBAHAN REST API
                         }
         except Exception as e:
-            print(f"[-] Gagal REST API:")
-            traceback.print_exc()
+            pass
 
     # ==========================================
     # TELEGRAM SENDER
@@ -149,7 +146,7 @@ class BinanceProScanner:
             print(f"[-] Error Telegram: {e}")
 
     # ==========================================
-    # PANDAS ENGINE: PEMROSESAN DATA SUPER CEPAT
+    # PANDAS ENGINE: PROSES GAINERS & LOSERS
     # ==========================================
     def proses_dan_kirim(self):
         if len(self.market_data) < 150:
@@ -158,78 +155,64 @@ class BinanceProScanner:
         if not self.market_data:
             return
 
-        # 1. Ambil data dengan aman menggunakan copy untuk menghindari Error Iteration
         with self.data_lock:
             data_mentah = copy.deepcopy(self.market_data)
 
-        # 2. Konversi ke Pandas DataFrame (Sangat Cepat & Efisien)
+        # 1. Konversi ke DataFrame
         df = pd.DataFrame.from_dict(data_mentah, orient='index')
-        
-        # 3. Filter data (Hapus volume 0 untuk hindari error bagi nol / infinity)
         df = df[df['volume_koin'] > 0]
         
-        # 4. Kalkulasi Vectorized dengan Pandas & Numpy (Selesai dalam hitungan milidetik)
+        # 2. Kalkulasi Vectorized (VWAP & Selisih) untuk seluruh data agar cepat
         df['kalkulasi_usdt'] = df['volume_koin'] * df['harga_sekarang']
         df['selisih_usdt'] = df['kalkulasi_usdt'] - df['volume_usdt_asli']
         df['harga_target'] = df['volume_usdt_asli'] / df['volume_koin']
 
-        # Waktu Pemrosesan
+        # 3. FILTERING: Ambil 50 Top Gainers dan 50 Top Losers
+        top_gainers = df.nlargest(50, 'perubahan_persen') # 50 Teratas (Paling Plus)
+        top_losers = df.nsmallest(50, 'perubahan_persen') # 50 Terbawah (Paling Minus)
+
         waktu_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        batas = 50
 
-        # --- LAPORAN 1: TOP 50 VOLUME USDT ASLI ---
-        df_vol_usdt = df.nlargest(batas, 'volume_usdt_asli')
-        pesan_vol_usdt = f"💰 <b>TOP {batas} VOL USDT (ASLI)</b> 💰\n"
-        pesan_vol_usdt += f"🕒 <i>{waktu_update}</i>\n<code>Koin | Harga | Vol USDT</code>\n----------------------------\n"
-        
-        for i, row in enumerate(df_vol_usdt.itertuples(), 1):
-            nama = row.simbol.replace("USDT", "")
-            pesan_vol_usdt += f"{i}. <b>{nama}</b> | {format_harga(row.harga_sekarang)} | <b>${format_angka_besar(row.volume_usdt_asli)}</b>\n"
-        
-        self.kirim_pesan_telegram(pesan_vol_usdt)
-        time.sleep(1)
-
-        # --- LAPORAN 2: TOP 50 VOLUME KOIN ---
-        df_vol_koin = df.nlargest(batas, 'volume_koin')
-        pesan_vol_koin = f"🪙 <b>TOP {batas} VOL KOIN</b> 🪙\n"
-        pesan_vol_koin += f"🕒 <i>{waktu_update}</i>\n<code>Koin | Jml Token | Kalk USDT</code>\n----------------------------\n"
-        
-        for i, row in enumerate(df_vol_koin.itertuples(), 1):
-            nama = row.simbol.replace("USDT", "")
-            pesan_vol_koin += f"{i}. <b>{nama}</b> | {format_angka_besar(row.volume_koin)} | <b>${format_angka_besar(row.kalkulasi_usdt)}</b>\n"
+        # ================================================================
+        # FUNGSI HELPER UNTUK MEMBUAT TEKS LAPORAN
+        # ================================================================
+        def buat_laporan(judul, dataframe, ikon, start_idx=1):
+            pesan = f"{ikon} <b>{judul}</b> {ikon}\n"
+            pesan += f"🕒 <i>{waktu_update}</i>\n"
+            pesan += "<code>Koin (%24j) | Skrg -> Tgt | Selisih</code>\n"
+            pesan += "-" * 38 + "\n"
             
-        self.kirim_pesan_telegram(pesan_vol_koin)
-        time.sleep(1)
-
-        # --- LAPORAN 3 & 4: ANALISA VWAP (SELISIH) ---
-        df_selisih = df.nlargest(batas, 'selisih_usdt')
-        
-        # Part 1 (Top 1-25)
-        pesan_analisa_1 = f"🎯 <b>ANALISA VWAP (Top 1-25)</b> 🎯\n"
-        pesan_analisa_1 += f"🕒 <i>{waktu_update}</i>\n<code>Koin | Harga Skrg -> Harga Tgt | Selisih</code>\n---------------------------------------\n"
-        
-        for i, row in enumerate(df_selisih.head(25).itertuples(), 1):
-            nama = row.simbol.replace("USDT", "")
-            indikator = "🟢" if row.harga_sekarang >= row.harga_target else "🔴"
-            pesan_analisa_1 += f"{i}. <b>{nama}</b>\n↳ {indikator} {format_harga(row.harga_sekarang)} -> 🎯 {format_harga(row.harga_target)} | <b>${format_angka_besar(row.selisih_usdt)}</b>\n"
+            for i, row in enumerate(dataframe.itertuples(), start_idx):
+                nama = row.simbol.replace("USDT", "")
+                persen = f"+{row.perubahan_persen:.2f}%" if row.perubahan_persen > 0 else f"{row.perubahan_persen:.2f}%"
+                
+                indikator_vwap = "🟢" if row.harga_sekarang >= row.harga_target else "🔴"
+                
+                pesan += f"{i}. <b>{nama}</b> ({persen})\n"
+                pesan += f"↳ {indikator_vwap} {format_harga(row.harga_sekarang)} -> 🎯 {format_harga(row.harga_target)} | <b>${format_angka_besar(row.selisih_usdt)}</b>\n"
             
-        self.kirim_pesan_telegram(pesan_analisa_1)
-        time.sleep(1)
+            return pesan
 
-        # Part 2 (Top 26-50)
-        pesan_analisa_2 = f"🎯 <b>ANALISA VWAP (Top 26-50)</b> 🎯\n---------------------------------------\n"
-        
-        # Ambil baris ke 25 sampai akhir (50) menggunakan Pandas iloc
-        for i, row in enumerate(df_selisih.iloc[25:].itertuples(), 26):
-            nama = row.simbol.replace("USDT", "")
-            indikator = "🟢" if row.harga_sekarang >= row.harga_target else "🔴"
-            pesan_analisa_2 += f"{i}. <b>{nama}</b>\n↳ {indikator} {format_harga(row.harga_sekarang)} -> 🎯 {format_harga(row.harga_target)} | <b>${format_angka_besar(row.selisih_usdt)}</b>\n"
-            
-        pesan_analisa_2 += "\n🤖 <i>Scanner Engine: Pandas + CCXT</i>"
-        self.kirim_pesan_telegram(pesan_analisa_2)
+        # --- KIRIM LAPORAN TOP GAINERS (Dibagi 2 karena limit Telegram) ---
+        pesan_gainer_1 = buat_laporan("TOP GAINERS 1-25", top_gainers.iloc[0:25], "📈")
+        self.kirim_pesan_telegram(pesan_gainer_1)
+        time.sleep(1.5)
+
+        pesan_gainer_2 = buat_laporan("TOP GAINERS 26-50", top_gainers.iloc[25:50], "📈", start_idx=26)
+        self.kirim_pesan_telegram(pesan_gainer_2)
+        time.sleep(1.5)
+
+        # --- KIRIM LAPORAN TOP LOSERS (Dibagi 2 karena limit Telegram) ---
+        pesan_loser_1 = buat_laporan("TOP LOSERS 1-25", top_losers.iloc[0:25], "📉")
+        self.kirim_pesan_telegram(pesan_loser_1)
+        time.sleep(1.5)
+
+        pesan_loser_2 = buat_laporan("TOP LOSERS 26-50", top_losers.iloc[25:50], "📉", start_idx=26)
+        pesan_loser_2 += "\n🤖 <i>Scanner Engine: Pandas + WS</i>"
+        self.kirim_pesan_telegram(pesan_loser_2)
 
         os.system('cls' if os.name == 'nt' else 'clear')
-        print(f"=== Selesai Memproses Laporan Pandas DataFrame ({waktu_update}) ===")
+        print(f"=== Selesai Mengirim Laporan Gainers & Losers ({waktu_update}) ===")
 
     def jalankan(self, interval_menit=5):
         self.mulai_websocket()
@@ -238,7 +221,6 @@ class BinanceProScanner:
 
         try:
             while True:
-                # Menggunakan ThreadPoolExecutor untuk pemrosesan paralel jika dibutuhkan kedepannya
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     executor.submit(self.proses_dan_kirim)
                 
