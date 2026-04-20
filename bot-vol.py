@@ -23,6 +23,21 @@ BINANCE_SECRET_KEY = os.environ.get('BINANCE_API_SECRET', 'FmZNNbIOWIAddxVoLcNow
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN', '8562793193:AAHDulfzVhhnuPfNfy4Zk6ONBNSNbGwVJ8c')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '-1003835878828')
 
+# --- NAMA FILE LOG ---
+LOG_FILE = "scanner_log.txt"
+
+def tulis_log(pesan):
+    """Fungsi untuk menulis catatan aktivitas bot ke dalam file teks."""
+    waktu = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    baris_log = f"[{waktu}] {pesan}\n"
+    
+    # Tampilkan juga di layar terminal
+    print(baris_log.strip())
+    
+    # Simpan (append) ke file log
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(baris_log)
+
 def format_angka_besar(angka):
     """Fungsi hemat karakter untuk Telegram"""
     if pd.isna(angka): return "0"
@@ -63,6 +78,8 @@ class BinanceProScanner:
             'secret': BINANCE_SECRET_KEY,
             'enableRateLimit': True,
         })
+        
+        tulis_log("=== BOT DIJALANKAN ===")
 
     # ==========================================
     # WEBSOCKET HANDLING (BACKGROUND)
@@ -79,21 +96,21 @@ class BinanceProScanner:
                             'harga_sekarang': float(koin['c']),
                             'volume_koin': float(koin['v']),
                             'volume_usdt_asli': float(koin['q']),
-                            'perubahan_persen': float(koin['P']) # <--- TAMBAHAN: Ambil % perubahan 24j
+                            'perubahan_persen': float(koin['P']) 
                         }
         except Exception:
             pass
 
     def on_error(self, ws, error):
-        print(f"[-] WS Error: {error}")
+        tulis_log(f"ERROR: WebSocket Error - {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
         self.ws_connected = False
-        print("[!] WS Terputus. Bot akan menggunakan REST API sementara.")
+        tulis_log("WARNING: WebSocket Terputus. Menunggu reconnect / REST API fallback.")
 
     def on_open(self, ws):
         self.ws_connected = True
-        print("[+] WS Stream Binance Aktif.")
+        tulis_log("INFO: Berhasil terhubung ke WebSocket Binance stream.")
 
     def mulai_websocket(self):
         ws = websocket.WebSocketApp(self.ws_url,
@@ -109,6 +126,7 @@ class BinanceProScanner:
     # REST API FALLBACK
     # ==========================================
     def ambil_data_rest_api(self):
+        tulis_log("INFO: Mengambil data tambahan via REST API (Fallback)...")
         headers = {'X-MBX-APIKEY': BINANCE_API_KEY}
         try:
             respons = requests.get(self.rest_url, headers=headers)
@@ -124,10 +142,11 @@ class BinanceProScanner:
                             'harga_sekarang': float(koin['lastPrice']),
                             'volume_koin': float(koin['volume']),
                             'volume_usdt_asli': float(koin['quoteVolume']),
-                            'perubahan_persen': float(koin['priceChangePercent']) # <--- TAMBAHAN REST API
+                            'perubahan_persen': float(koin['priceChangePercent']) 
                         }
+            tulis_log("INFO: Data REST API berhasil diambil.")
         except Exception as e:
-            pass
+            tulis_log(f"ERROR: Gagal mengambil REST API - {e}")
 
     # ==========================================
     # TELEGRAM SENDER
@@ -141,18 +160,23 @@ class BinanceProScanner:
             'disable_web_page_preview': True
         }
         try:
-            requests.post(url, data=payload, timeout=10)
+            respons = requests.post(url, data=payload, timeout=10)
+            if respons.status_code != 200:
+                tulis_log(f"WARNING: Telegram menolak pesan (Status {respons.status_code})")
         except Exception as e:
-            print(f"[-] Error Telegram: {e}")
+            tulis_log(f"ERROR: Jaringan Telegram - {e}")
 
     # ==========================================
-    # PANDAS ENGINE: PROSES GAINERS & LOSERS
+    # PANDAS ENGINE & LOGIKA SCAN
     # ==========================================
     def proses_dan_kirim(self):
+        tulis_log("INFO: Memulai proses komputasi data (Pandas Engine)...")
+        
         if len(self.market_data) < 150:
             self.ambil_data_rest_api()
 
         if not self.market_data:
+            tulis_log("WARNING: Memori market data kosong, melewati siklus ini.")
             return
 
         with self.data_lock:
@@ -162,14 +186,14 @@ class BinanceProScanner:
         df = pd.DataFrame.from_dict(data_mentah, orient='index')
         df = df[df['volume_koin'] > 0]
         
-        # 2. Kalkulasi Vectorized (VWAP & Selisih) untuk seluruh data agar cepat
+        # 2. Kalkulasi Vectorized (VWAP & Selisih)
         df['kalkulasi_usdt'] = df['volume_koin'] * df['harga_sekarang']
         df['selisih_usdt'] = df['kalkulasi_usdt'] - df['volume_usdt_asli']
         df['harga_target'] = df['volume_usdt_asli'] / df['volume_koin']
 
         # 3. FILTERING: Ambil 50 Top Gainers dan 50 Top Losers
-        top_gainers = df.nlargest(50, 'perubahan_persen') # 50 Teratas (Paling Plus)
-        top_losers = df.nsmallest(50, 'perubahan_persen') # 50 Terbawah (Paling Minus)
+        top_gainers = df.nlargest(50, 'perubahan_persen') 
+        top_losers = df.nsmallest(50, 'perubahan_persen')
 
         waktu_update = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -185,15 +209,16 @@ class BinanceProScanner:
             for i, row in enumerate(dataframe.itertuples(), start_idx):
                 nama = row.simbol.replace("USDT", "")
                 persen = f"+{row.perubahan_persen:.2f}%" if row.perubahan_persen > 0 else f"{row.perubahan_persen:.2f}%"
-                
                 indikator_vwap = "🟢" if row.harga_sekarang >= row.harga_target else "🔴"
                 
                 pesan += f"{i}. <b>{nama}</b> ({persen})\n"
                 pesan += f"↳ {indikator_vwap} {format_harga(row.harga_sekarang)} -> 🎯 {format_harga(row.harga_target)} | <b>${format_angka_besar(row.selisih_usdt)}</b>\n"
-            
             return pesan
 
-        # --- KIRIM LAPORAN TOP GAINERS (Dibagi 2 karena limit Telegram) ---
+        tulis_log("INFO: Mengirim laporan ke Telegram...")
+        
+        # --- KIRIM LAPORAN ---
+        # Gainers
         pesan_gainer_1 = buat_laporan("TOP GAINERS 1-25", top_gainers.iloc[0:25], "📈")
         self.kirim_pesan_telegram(pesan_gainer_1)
         time.sleep(1.5)
@@ -202,37 +227,40 @@ class BinanceProScanner:
         self.kirim_pesan_telegram(pesan_gainer_2)
         time.sleep(1.5)
 
-        # --- KIRIM LAPORAN TOP LOSERS (Dibagi 2 karena limit Telegram) ---
+        # Losers
         pesan_loser_1 = buat_laporan("TOP LOSERS 1-25", top_losers.iloc[0:25], "📉")
         self.kirim_pesan_telegram(pesan_loser_1)
         time.sleep(1.5)
 
         pesan_loser_2 = buat_laporan("TOP LOSERS 26-50", top_losers.iloc[25:50], "📉", start_idx=26)
-        pesan_loser_2 += "\n🤖 <i>Scanner Engine: Pandas + WS</i>"
+        pesan_loser_2 += "\n🤖 <i>Scanner 1 Menit Berjalan...</i>"
         self.kirim_pesan_telegram(pesan_loser_2)
 
-        os.system('cls' if os.name == 'nt' else 'clear')
-        print(f"=== Selesai Mengirim Laporan Gainers & Losers ({waktu_update}) ===")
+        tulis_log("SUCCESS: Siklus scan & pengiriman selesai.")
 
-    def jalankan(self, interval_menit=5):
+    def jalankan(self, interval_menit=1):
         self.mulai_websocket()
-        print("Menunggu 5 detik untuk mengumpulkan data stream Binance...")
+        tulis_log("INFO: Menunggu 5 detik untuk mengumpulkan data stream...")
         time.sleep(5)
 
         try:
             while True:
+                # Menjalankan proses utama di background agar tidak mengunci loop waktu
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                     executor.submit(self.proses_dan_kirim)
                 
+                # Menggunakan interval 1 menit (60 detik)
                 waktu_tunggu = interval_menit * 60
-                print(f"Menunggu {interval_menit} menit untuk siklus berikutnya...\n")
+                tulis_log(f"INFO: Menunggu {interval_menit} menit ({waktu_tunggu} detik) untuk siklus berikutnya...")
                 time.sleep(waktu_tunggu)
                 
         except KeyboardInterrupt:
-            print("\n[!] Bot Scanner Pandas dihentikan.")
+            tulis_log("=== BOT DIHENTIKAN OLEH PENGGUNA (Ctrl+C) ===")
         except Exception as e:
+            tulis_log(f"FATAL ERROR: Terjadi kegagalan sistem - {e}")
             traceback.print_exc()
 
 if __name__ == "__main__":
     scanner = BinanceProScanner()
-    scanner.jalankan(interval_menit=5)
+    # Mengubah interval menjadi 1 menit
+    scanner.jalankan(interval_menit=1)
